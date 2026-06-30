@@ -1,6 +1,6 @@
 # Rickshaw
 
-A multi-LLM provider harness with a normalized interface, user-selectable reasoning effort levels, and an optional embedding-backed ontology layer.
+A multi-LLM provider harness with a normalized interface and user-selectable reasoning effort levels.
 
 ## Setup
 
@@ -90,42 +90,6 @@ print(caps.streaming)    # True
 print(caps.embeddings)   # True
 print(caps.effort_levels)  # [Effort.LOW, Effort.MEDIUM, Effort.HIGH]
 ```
-
-## Ontology layer (optional)
-
-Rickshaw includes a symbolic ontology graph for user-defined concept schemas:
-
-```python
-from rickshaw.ontology import Entity, OntologyGraph, Relationship
-
-graph = OntologyGraph("my_ontology.json")
-graph.add_entity(Entity(id="py", entity_type="language", fields={"label": "Python"}))
-graph.add_entity(Entity(id="js", entity_type="language", fields={"label": "JavaScript"}))
-graph.add_relationship(Relationship(source_id="py", target_id="js", relation_type="similar_to"))
-graph.save()
-```
-
-### Embedding-backed concept matching
-
-When an embedding-capable provider is configured (e.g. OpenAI), the `ConceptMatcher` can:
-
-- **Classify/auto-tag** new text against existing entities.
-- **Detect synonym/duplicate** concepts.
-- **Suggest fuzzy links** between text and entities.
-
-All results are **suggestions only** — they never silently decide.
-
-```python
-from rickshaw.ontology.concept_matcher import ConceptMatcher
-
-matcher = ConceptMatcher(provider=embedding_provider, graph=graph)
-if matcher.available:
-    matches = matcher.classify("Python programming")
-    for m in matches:
-        print(f"  {m.entity.id}: {m.score:.3f}")
-```
-
-If no embedding-capable provider is configured, `matcher.available` returns `False` and calling embedding methods raises a clear error.
 
 ## Tests
 

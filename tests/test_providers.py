@@ -139,10 +139,111 @@ def test_devin_complete_returns_normalized_response():
     assert response.usage.total_tokens == 12
 
 
+@respx.mock
+def test_devin_complete_preserves_effort_in_response():
+    """The effort passed to complete() should be reflected in the Response."""
+    respx.post("https://api.devin.ai/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=DEVIN_CHAT_RESPONSE)
+    )
+    provider = DevinProvider(api_key="test-key")
+    messages = [Message(role="user", content="Hi")]
+
+    for effort in Effort:
+        response = provider.complete(messages, effort=effort)
+        assert response.effort == effort
+
+
+@respx.mock
+def test_devin_complete_with_extra_kwargs():
+    """Extra kwargs should be forwarded in the request payload."""
+    route = respx.post("https://api.devin.ai/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=DEVIN_CHAT_RESPONSE)
+    )
+    provider = DevinProvider(api_key="test-key")
+    messages = [Message(role="user", content="Hi")]
+    provider.complete(messages, temperature=0.5)
+
+    sent_payload = json.loads(route.calls[0].request.content)
+    assert sent_payload["temperature"] == 0.5
+
+
+@respx.mock
+def test_devin_complete_sends_correct_message_format():
+    """Messages should be serialized as [{role, content}, ...]."""
+    route = respx.post("https://api.devin.ai/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=DEVIN_CHAT_RESPONSE)
+    )
+    provider = DevinProvider(api_key="test-key")
+    messages = [
+        Message(role="system", content="You are helpful."),
+        Message(role="user", content="Hello"),
+    ]
+    provider.complete(messages)
+
+    sent_payload = json.loads(route.calls[0].request.content)
+    assert sent_payload["messages"] == [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hello"},
+    ]
+
+
+@respx.mock
+def test_devin_complete_sends_auth_header():
+    """The Authorization header should carry the API key."""
+    route = respx.post("https://api.devin.ai/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=DEVIN_CHAT_RESPONSE)
+    )
+    provider = DevinProvider(api_key="my-secret-key")
+    provider.complete([Message(role="user", content="Hi")])
+
+    auth = route.calls[0].request.headers["authorization"]
+    assert auth == "Bearer my-secret-key"
+
+
+@respx.mock
+def test_devin_complete_handles_http_error():
+    """HTTP errors should propagate as exceptions."""
+    respx.post("https://api.devin.ai/v1/chat/completions").mock(
+        return_value=httpx.Response(500, json={"error": "internal"})
+    )
+    provider = DevinProvider(api_key="test-key")
+    with pytest.raises(httpx.HTTPStatusError):
+        provider.complete([Message(role="user", content="Hi")])
+
+
+@respx.mock
+def test_devin_complete_handles_empty_choices():
+    """Gracefully handle a response with empty choices."""
+    respx.post("https://api.devin.ai/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={"model": "devin", "choices": [{}]})
+    )
+    provider = DevinProvider(api_key="test-key")
+    response = provider.complete([Message(role="user", content="Hi")])
+    assert response.text == ""
+    assert response.model == "devin"
+
+
+@respx.mock
+def test_devin_complete_custom_base_url():
+    """A custom base URL should be used for requests."""
+    respx.post("https://custom.devin.example/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=DEVIN_CHAT_RESPONSE)
+    )
+    provider = DevinProvider(api_key="test-key", base_url="https://custom.devin.example")
+    response = provider.complete([Message(role="user", content="Hi")])
+    assert response.text == "Hello from Devin!"
+
+
 def test_devin_validate_no_key():
     provider = DevinProvider(api_key="")
     with pytest.raises(ValueError, match="DEVIN_API_KEY"):
         provider.validate()
+
+
+def test_devin_validate_with_key():
+    """validate() should not raise when an API key is provided."""
+    provider = DevinProvider(api_key="test-key")
+    provider.validate()
 
 
 def test_devin_capabilities_no_embeddings():
@@ -150,6 +251,29 @@ def test_devin_capabilities_no_embeddings():
     caps = provider.capabilities()
     assert caps.embeddings is False
     assert caps.streaming is False
+
+
+def test_devin_capabilities_full():
+    """Verify all capability fields for completeness."""
+    provider = DevinProvider(api_key="test-key")
+    caps = provider.capabilities()
+    assert caps.embeddings is False
+    assert caps.streaming is False
+    assert caps.function_calling is False
+    assert caps.vision is False
+    assert caps.max_context_tokens == 128_000
+    assert caps.effort_levels == []
+
+
+def test_devin_available_models():
+    provider = DevinProvider(api_key="test-key")
+    models = provider.available_models()
+    assert "devin" in models
+
+
+def test_devin_name():
+    provider = DevinProvider(api_key="test-key")
+    assert provider.name == "devin"
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +292,19 @@ def test_stream_fallback_to_complete():
     assert chunks == ["Hello from Devin!"]
 
 
+@respx.mock
+def test_stream_fallback_preserves_effort():
+    """Stream fallback should forward the effort level to complete()."""
+    respx.post("https://api.devin.ai/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=DEVIN_CHAT_RESPONSE)
+    )
+    provider = DevinProvider(api_key="test-key")
+    messages = [Message(role="user", content="Hi")]
+    chunks = list(provider.stream(messages, effort=Effort.HIGH))
+    assert len(chunks) == 1
+    assert chunks[0] == "Hello from Devin!"
+
+
 # ---------------------------------------------------------------------------
 # Effort degradation
 # ---------------------------------------------------------------------------
@@ -177,3 +314,16 @@ def test_effort_levels_empty_degrades_gracefully():
     provider = DevinProvider(api_key="test-key")
     caps = provider.capabilities()
     assert caps.effort_levels == []
+
+
+@respx.mock
+def test_devin_accepts_all_effort_levels_without_error():
+    """Even without effort support, all effort values should be accepted."""
+    respx.post("https://api.devin.ai/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=DEVIN_CHAT_RESPONSE)
+    )
+    provider = DevinProvider(api_key="test-key")
+    messages = [Message(role="user", content="Hi")]
+    for effort in Effort:
+        response = provider.complete(messages, effort=effort)
+        assert response.text == "Hello from Devin!"
