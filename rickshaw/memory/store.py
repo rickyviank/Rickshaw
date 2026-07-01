@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 from rickshaw.memory._math import cosine_similarity
+from rickshaw.memory._vector_ext import pack_float32, try_load_extension
 from rickshaw.memory.record import MemoryRecord, MemoryScope, MemoryType
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS memories (
@@ -38,35 +42,102 @@ def _iso_to_dt(s: str) -> datetime:
 class MemoryStore:
     """SQLite-backed store for MemoryRecords."""
 
-    def __init__(self, db_path: str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        db_path: str | Path = ":memory:",
+        vector_dim: int | None = None,
+        use_vector_ext: bool = True,
+    ) -> None:
         self._conn = sqlite3.connect(str(db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_SCHEMA)
         self._conn.commit()
 
+        # Optional indexed vector search via the sqlite-vector extension.
+        # Falls back to brute-force cosine when unavailable (see _vector_ext).
+        self._vector_dim = vector_dim
+        self._vector_enabled = False
+        if use_vector_ext and vector_dim:
+            self._vector_enabled = try_load_extension(self._conn)
+            if self._vector_enabled:
+                self._init_vector_column()
+
+    @property
+    def vector_search_enabled(self) -> bool:
+        """Whether indexed vector search (sqlite-vector) is active."""
+        return self._vector_enabled
+
+    def _init_vector_column(self) -> None:
+        """Add and initialize the FLOAT32 vector column for the extension."""
+        try:
+            cols = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()
+            }
+            if "embedding_vec" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN embedding_vec BLOB")
+            self._conn.execute(
+                "SELECT vector_init('memories', 'embedding_vec', ?)",
+                (f"dimension={self._vector_dim},type=FLOAT32,distance=cosine",),
+            )
+            self._conn.commit()
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialize sqlite-vector column (%s); "
+                "using brute-force cosine fallback.",
+                exc,
+            )
+            self._vector_enabled = False
+
     def close(self) -> None:
         self._conn.close()
 
     def put(self, record: MemoryRecord) -> None:
-        self._conn.execute(
-            """INSERT OR REPLACE INTO memories
-               (id, text, embedding, scope, type, importance,
-                created_at, last_used_at, use_count, sensitive, superseded_by)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                record.id,
-                record.text,
-                json.dumps(record.embedding),
-                record.scope.value,
-                record.type.value,
-                record.importance,
-                _dt_to_iso(record.created_at),
-                _dt_to_iso(record.last_used_at),
-                record.use_count,
-                int(record.sensitive),
-                record.superseded_by,
-            ),
-        )
+        # embedding is always stored as JSON text for reconstruction and the
+        # brute-force fallback; embedding_vec (FLOAT32 blob) is populated only
+        # when the sqlite-vector extension is active.
+        if self._vector_enabled:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO memories
+                   (id, text, embedding, scope, type, importance,
+                    created_at, last_used_at, use_count, sensitive,
+                    superseded_by, embedding_vec)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.id,
+                    record.text,
+                    json.dumps(record.embedding),
+                    record.scope.value,
+                    record.type.value,
+                    record.importance,
+                    _dt_to_iso(record.created_at),
+                    _dt_to_iso(record.last_used_at),
+                    record.use_count,
+                    int(record.sensitive),
+                    record.superseded_by,
+                    pack_float32(record.embedding),
+                ),
+            )
+        else:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO memories
+                   (id, text, embedding, scope, type, importance,
+                    created_at, last_used_at, use_count, sensitive, superseded_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.id,
+                    record.text,
+                    json.dumps(record.embedding),
+                    record.scope.value,
+                    record.type.value,
+                    record.importance,
+                    _dt_to_iso(record.created_at),
+                    _dt_to_iso(record.last_used_at),
+                    record.use_count,
+                    int(record.sensitive),
+                    record.superseded_by,
+                ),
+            )
         self._conn.commit()
 
     def get(self, record_id: str) -> MemoryRecord | None:
@@ -83,11 +154,64 @@ class MemoryStore:
         scope_filter: list[MemoryScope] | None = None,
         limit: int = 20,
     ) -> list[tuple[MemoryRecord, float]]:
-        """Return records ranked by cosine similarity, with optional scope filter.
+        """Return records ranked by similarity, with optional scope filter.
 
-        Metadata scope filter is applied FIRST in SQL, then brute-force
-        cosine similarity over candidate rows.
+        The metadata scope filter is applied FIRST in SQL. When the
+        sqlite-vector extension is loaded, the ranked KNN search runs inside
+        SQLite; otherwise we fall back to a brute-force cosine scan over the
+        scope-filtered candidate rows.
         """
+        if self._vector_enabled:
+            try:
+                return self._search_vector_ext(query_vec, scope_filter, limit)
+            except Exception as exc:
+                logger.warning(
+                    "sqlite-vector search failed (%s); "
+                    "falling back to brute-force cosine scan.",
+                    exc,
+                )
+        return self._search_bruteforce(query_vec, scope_filter, limit)
+
+    def _search_vector_ext(
+        self,
+        query_vec: list[float],
+        scope_filter: list[MemoryScope] | None,
+        limit: int,
+    ) -> list[tuple[MemoryRecord, float]]:
+        """KNN search via sqlite-vector, scope-filtered in SQL first.
+
+        Uses streaming mode (no ``k`` arg) so the SQL ``WHERE`` scope filter is
+        applied before ranking. cosine *distance* is converted to similarity.
+        """
+        where = ["m.superseded_by IS NULL"]
+        params: list[object] = [pack_float32(query_vec)]
+        if scope_filter:
+            placeholders = ",".join("?" for _ in scope_filter)
+            where.append(f"m.scope IN ({placeholders})")
+            params.extend(s.value for s in scope_filter)
+        params.append(limit)
+        query = (
+            "SELECT m.*, v.distance AS _distance "
+            "FROM vector_full_scan('memories', 'embedding_vec', ?) AS v "
+            "JOIN memories m ON m.rowid = v.rowid "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY v.distance ASC LIMIT ?"
+        )
+        rows = self._conn.execute(query, params).fetchall()
+        scored: list[tuple[MemoryRecord, float]] = []
+        for row in rows:
+            record = self._row_to_record(row)
+            sim = 1.0 - float(row["_distance"])
+            scored.append((record, sim))
+        return scored
+
+    def _search_bruteforce(
+        self,
+        query_vec: list[float],
+        scope_filter: list[MemoryScope] | None,
+        limit: int,
+    ) -> list[tuple[MemoryRecord, float]]:
+        """Scope-filter in SQL, then brute-force cosine over candidate rows."""
         if scope_filter:
             placeholders = ",".join("?" for _ in scope_filter)
             query = (
