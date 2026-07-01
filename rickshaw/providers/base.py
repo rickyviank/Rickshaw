@@ -34,6 +34,38 @@ class TokenUsage:
 
 
 @dataclass
+class ToolSpec:
+    """Description of a tool the model may call.
+
+    ``category`` classifies the tool (e.g. ``"memory"`` vs ``"general"``) so the
+    orchestrator can apply category-specific handling. ``side_effect`` marks
+    whether invoking the tool mutates state: read-only tools (``side_effect=
+    False``) do not count against the orchestrator's bounded tool-round budget.
+    """
+
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    category: str = "general"
+    side_effect: bool = True
+
+
+@dataclass
+class ToolCall:
+    """A normalized tool/function call returned by the model.
+
+    This is a pure, vendor-neutral data container. Provider-specific parsing
+    (e.g. from OpenAI's wire format) lives on each provider via a
+    ``_parse_tool_calls`` method, not on this dataclass.
+    """
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class Response:
     """Normalized response from any LLM provider."""
 
@@ -42,6 +74,7 @@ class Response:
     usage: TokenUsage = field(default_factory=TokenUsage)
     effort: Effort = Effort.MEDIUM
     raw: dict[str, Any] = field(default_factory=dict)
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
 @dataclass
@@ -83,14 +116,27 @@ class LLMProvider(ABC):
         self,
         messages: list[Message],
         effort: Effort = Effort.MEDIUM,
+        tools: list[ToolSpec] | None = None,
+        tool_choice: str | None = None,
         **kwargs: Any,
     ) -> Response:
-        """Send *messages* and return a normalized :class:`Response`."""
+        """Send *messages* and return a normalized :class:`Response`.
+
+        *tools* advertises the tool specifications available to the model.
+        Providers that do not support function-calling should ignore it.
+
+        *tool_choice* controls whether the model is encouraged, required, or
+        forbidden from selecting a tool. Accepts ``"auto"`` (model decides),
+        ``"none"`` (never call a tool), ``"required"`` (must call a tool), or
+        ``None`` (provider default). It only has effect when *tools* is set.
+        """
 
     def stream(
         self,
         messages: list[Message],
         effort: Effort = Effort.MEDIUM,
+        tools: list[ToolSpec] | None = None,
+        tool_choice: str | None = None,
         **kwargs: Any,
     ) -> Iterator[str]:
         """Yield incremental text chunks.
@@ -99,7 +145,9 @@ class LLMProvider(ABC):
         the full text as a single chunk, so providers without native streaming
         still satisfy the interface.
         """
-        response = self.complete(messages, effort=effort, **kwargs)
+        response = self.complete(
+            messages, effort=effort, tools=tools, tool_choice=tool_choice, **kwargs
+        )
         yield response.text
 
     @abstractmethod
