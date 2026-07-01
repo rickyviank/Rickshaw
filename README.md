@@ -67,24 +67,32 @@ rickshaw --provider openai --validate-only
 
 ### Terminal UI (`rickshaw-tui`)
 
-A lightweight, Rich-formatted alternative to the plain REPL. It is *not* a
-full-screen app — just the same line-oriented loop with prettier output
-(branded header panel, Markdown-rendered replies, and a per-turn status line).
-Crucially, every turn is routed through the `Orchestrator`, so the semantic
-memory layer (`remember`/`recall`/`forget`) and graceful-degradation info are
-active and surfaced.
+A full-screen terminal UI (built on [Textual](https://textual.textualize.io/)),
+in the spirit of Claude Code / Codex: a scrollable transcript, a pinned input at
+the bottom, a status bar (provider · model · effort), **streaming** replies
+rendered as Markdown, a "thinking" indicator, and slash-command autocomplete.
+Every turn is routed through the `Orchestrator`, so the semantic memory layer
+(`remember`/`recall`/`forget`) and graceful-degradation info are active and
+surfaced.
 
 ```bash
-# Install the optional extra (adds Rich)
+# Install the optional extra (adds Textual + Rich)
 pip install -e ".[tui]"
 
 # Launch it
 rickshaw-tui --provider openai --effort high
 ```
 
-Memory persists to a local SQLite file (`--db-path`, default
-`rickshaw_memory.db`) so context carries across sessions. Slash-commands match
-the REPL: `/effort <level>`, `/quit`, `/exit`.
+- **Streaming:** when the provider supports it *and* isn't advertising tools,
+  replies stream token by token; otherwise the final answer is rendered once
+  generation completes. (Streaming through the tool-call loop is a provider-side
+  follow-up — the provider's `stream()` doesn't yet parse tool calls.)
+- **Memory** persists to a local SQLite file (`--db-path`, default
+  `rickshaw_memory.db`) so context carries across sessions.
+- **Slash-commands:** `/help`, `/clear`, `/effort <level>`, `/model [name]`,
+  `/memory`, `/quit`. Type `/` for inline autocomplete.
+- **Keys:** `Esc` interrupts an in-flight turn, `Ctrl+L` clears the transcript,
+  `Ctrl+C` quits.
 
 ### Effort levels
 
@@ -177,7 +185,11 @@ result = registry.dispatch(ToolCall(id="1", name="recall", arguments={"query": "
 
 The `Orchestrator` accepts a `ToolRegistry` via DI (defaulting to the memory
 registry) and returns a structured `TurnResult(text, warnings, tool_calls_made,
-degraded)` so callers can detect degradation without parsing the text.
+degraded, model, usage)` so callers can detect degradation without parsing the
+text. `run_turn(task_input, on_delta=...)` optionally streams the final answer:
+with a streaming provider that isn't advertising tools it yields real token
+deltas via `provider.stream()`; otherwise it delivers the final text as a single
+delta. Passing `on_delta=None` preserves the original non-streaming behavior.
 
 ## Semantic Memory Layer
 
@@ -240,7 +252,7 @@ pip install -e ".[vector]"   # installs chromadb
 
 | Extra | Install | Purpose |
 |---|---|---|
-| `tui` | `pip install -e ".[tui]"` | Rich-based terminal UI (`rickshaw-tui`). |
+| `tui` | `pip install -e ".[tui]"` | Full-screen terminal UI (`rickshaw-tui`, built on Textual). |
 | `vector` | `pip install -e ".[vector]"` | Indexed KNN search via ChromaDB (brute-force fallback otherwise). |
 | `schema` | `pip install -e ".[schema]"` | JSON-schema validation of tool-call arguments. |
 | `dev` | `pip install -e ".[dev]"` | Test toolchain (pytest, respx). |
