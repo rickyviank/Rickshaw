@@ -42,6 +42,7 @@ _DEFAULT_DB_PATH = "rickshaw_memory.db"
 # Slash-commands, used for help text and inline autocomplete.
 _COMMANDS = {
     "/help": "Show this help.",
+    "/status": "Show provider, model, and effort.",
     "/clear": "Clear the transcript.",
     "/effort": "/effort <low|medium|high> — set reasoning effort.",
     "/model": "/model [name] — show or switch the chat model.",
@@ -49,6 +50,9 @@ _COMMANDS = {
     "/quit": "Exit.",
     "/exit": "Exit.",
 }
+
+_DEFAULT_HINT = "/help  ·  esc interrupt  ·  ^c quit"
+_USER_MARK = "[#d98a3d]\u203a[/]"  # amber angle-quote before each user message
 
 _TEXTUAL_MISSING_MSG = (
     "The Rickshaw terminal UI requires Textual, which is not installed.\n"
@@ -114,7 +118,7 @@ def make_app(
         from textual.binding import Binding
         from textual.containers import VerticalScroll
         from textual.suggester import SuggestFromList
-        from textual.widgets import Footer, Input, Markdown, Static
+        from textual.widgets import Input, Markdown, Rule, Static
     except ImportError as exc:  # pragma: no cover - exercised via message text
         raise SystemExit(_TEXTUAL_MISSING_MSG) from exc
 
@@ -125,33 +129,46 @@ def make_app(
 
         TITLE = "rickshaw"
         SUB_TITLE = RICKSHAW_SLOGAN
+        # Minimalist: no footer, no filled status bar, no boxed input.
+        # Near-monochrome with a single amber accent; hairline rules separate
+        # turns. Chrome is intentionally almost invisible.
         CSS = """
-        Screen { layout: vertical; }
-        #banner {
-            height: auto;
-            padding: 1 2 0 2;
-            color: $accent;
-            text-style: bold;
+        Screen { layout: vertical; background: #0e0f11; }
+        #head { height: auto; color: #4b5563; padding: 1 3 0 3; }
+        #transcript {
+            height: 1fr;
+            padding: 1 3;
+            scrollbar-size: 1 1;
+            scrollbar-color: #2a2e37;
+            scrollbar-color-hover: #3a3f47;
+            scrollbar-color-active: #3a3f47;
+            scrollbar-background: #0e0f11;
         }
-        #transcript { height: 1fr; padding: 0 2; }
-        #transcript > Static { margin: 1 0 0 0; }
-        #transcript > Markdown { margin: 0 0 0 0; }
-        .user { color: $success; text-style: bold; }
-        .meta { color: $text-muted; }
-        .warn { color: $warning; }
-        #status {
-            height: 1;
-            padding: 0 2;
-            background: $panel;
-            color: $text-muted;
+        #transcript > Static { margin: 0 0 1 0; }
+        #transcript > Markdown {
+            margin: 0 0 1 0;
+            padding: 0;
+            background: transparent;
         }
-        #prompt { dock: bottom; margin: 0 0 1 0; }
+        #transcript > Rule { color: #22252b; margin: 0 0 1 0; }
+        .u { color: #dfe2e7; }
+        .a { color: #9aa0a8; }
+        .meta { color: #5c6370; }
+        .warn { color: #c98a3d; }
+        #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
+        #prompt {
+            border: none;
+            background: #0e0f11;
+            color: #dfe2e7;
+            padding: 0 3;
+        }
+        #prompt:focus { border: none; }
         """
 
         BINDINGS = [
-            Binding("escape", "interrupt", "Interrupt", show=True),
-            Binding("ctrl+l", "clear", "Clear", show=True),
-            Binding("ctrl+c", "quit", "Quit", show=True),
+            Binding("escape", "interrupt", "Interrupt", show=False),
+            Binding("ctrl+l", "clear", "Clear", show=False),
+            Binding("ctrl+c", "quit", "Quit", show=False),
         ]
 
         def __init__(self) -> None:
@@ -164,34 +181,33 @@ def make_app(
             self._buffer = ""
             self._current_md: Markdown | None = None
             self._turn_active = False
+            self._has_turns = False
 
         # ---- layout -----------------------------------------------------
 
         def compose(self) -> ComposeResult:
-            yield Static(RICKSHAW_BANNER, id="banner")
+            yield Static(RICKSHAW_BANNER, id="head")
             yield VerticalScroll(id="transcript")
-            yield Static("", id="status")
+            yield Static(_DEFAULT_HINT, id="hint")
             yield Input(
-                placeholder="Message rickshaw…  (/help for commands)",
+                placeholder="Message rickshaw…",
                 id="prompt",
                 suggester=SuggestFromList(sorted(_COMMANDS), case_sensitive=False),
             )
-            yield Footer()
 
         def on_mount(self) -> None:
-            self._refresh_status()
             caps = self.provider.capabilities()
-            levels = (
-                ", ".join(e.value for e in caps.effort_levels)
-                if caps.effort_levels
-                else "(provider advertises no effort levels)"
-            )
+            model = getattr(self.provider, "_model", "") or self.provider.name
             self._write(
-                f"Connected to [b]{self.provider.name}[/b]. "
-                f"Supported effort: {levels}.",
+                f"{self.provider.name} · {model} · effort "
+                f"{self.orchestrator.effort.value} · /help",
                 cls="meta",
             )
-            self._write("Type a message, or /help for commands.", cls="meta")
+            if not caps.function_calling:
+                self._write(
+                    "tools off — recall is harness-driven for this provider.",
+                    cls="meta",
+                )
             self.query_one("#prompt", Input).focus()
 
         # ---- transcript helpers ----------------------------------------
@@ -213,15 +229,8 @@ def make_app(
         def _scroll_end(self) -> None:
             self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
 
-        def _refresh_status(self, note: str = "") -> None:
-            model = getattr(self.provider, "_model", "") or self.provider.name
-            bar = (
-                f"provider: {self.provider.name}   model: {model}   "
-                f"effort: {self.orchestrator.effort.value}"
-            )
-            if note:
-                bar = f"{bar}   |   {note}"
-            self.query_one("#status", Static).update(bar)
+        def _set_hint(self, text: str) -> None:
+            self.query_one("#hint", Static).update(text)
 
         # ---- input handling --------------------------------------------
 
@@ -247,6 +256,8 @@ def make_app(
                 self.exit()
             elif cmd == "/help":
                 self._cmd_help()
+            elif cmd == "/status":
+                self._cmd_status()
             elif cmd == "/clear":
                 self.action_clear()
             elif cmd == "/effort":
@@ -259,10 +270,19 @@ def make_app(
                 self._write(f"Unknown command {cmd!r}. Try /help.", "warn")
 
         def _cmd_help(self) -> None:
-            self._write("Commands:", "meta")
             for name, desc in _COMMANDS.items():
-                self._write(f"  [b]{name}[/b] — {desc}", "meta")
-            self._write("  Esc interrupts a running turn; Ctrl+C quits.", "meta")
+                self._write(f"{name}  {desc}", "meta")
+            self._write("esc interrupts a running turn · ^c quits", "meta")
+
+        def _cmd_status(self) -> None:
+            model = getattr(self.provider, "_model", "") or self.provider.name
+            caps = self.provider.capabilities()
+            tools = "tools on" if caps.function_calling else "tools off"
+            self._write(
+                f"{self.provider.name} · {model} · effort "
+                f"{self.orchestrator.effort.value} · {tools}",
+                "meta",
+            )
 
         def _cmd_effort(self, arg: str) -> None:
             level = arg.lower()
@@ -274,12 +294,11 @@ def make_app(
             caps = self.provider.capabilities()
             if caps.effort_levels and new_effort not in caps.effort_levels:
                 self._write(
-                    f"Warning: {self.provider.name} does not honor "
-                    f"effort={new_effort.value}; it may be ignored.",
+                    f"note: {self.provider.name} may ignore "
+                    f"effort={new_effort.value}.",
                     "warn",
                 )
-            self._refresh_status()
-            self._write(f"Effort set to {new_effort.value}.", "meta")
+            self._write(f"effort · {new_effort.value}", "meta")
 
         def _cmd_model(self, arg: str) -> None:
             if not arg:
@@ -293,8 +312,7 @@ def make_app(
                 return
             self.provider = new_provider
             self.orchestrator.provider = new_provider
-            self._refresh_status()
-            self._write(f"Model switched to {arg}.", "meta")
+            self._write(f"model · {arg}", "meta")
 
         def _cmd_memory(self) -> None:
             try:
@@ -303,20 +321,23 @@ def make_app(
                 self._write(f"Could not read memory: {exc}", "warn")
                 return
             if not records:
-                self._write("No memories stored yet.", "meta")
+                self._write("no memories stored yet.", "meta")
                 return
-            self._write(f"Stored memories ({len(records)}):", "meta")
+            self._write(f"memories · {len(records)}", "meta")
             for rec in records[-10:]:
                 snippet = rec.text if len(rec.text) <= 100 else rec.text[:97] + "…"
-                self._write(f"  · {snippet}", "meta")
+                self._write(f"  {snippet}", "meta")
 
         # ---- turn execution --------------------------------------------
 
         def _start_turn(self, text: str) -> None:
             self._turn_active = True
-            self._write(f"you> {text}", "user")
+            if self._has_turns:
+                self.query_one("#transcript", VerticalScroll).mount(Rule())
+            self._has_turns = True
+            self._write(f"{_USER_MARK} {text}", "u")
             self._begin_assistant()
-            self._refresh_status(note="thinking…")
+            self._set_hint("thinking…  ·  esc to interrupt")
             self.query_one("#prompt", Input).disabled = True
             self._run_turn(text)
 
@@ -345,14 +366,17 @@ def make_app(
                 # Non-streaming providers deliver everything in one delta; make
                 # sure the final rendered text matches the result exactly.
                 self._current_md.update(result.text)
-            parts = [f"tool calls: {result.tool_calls_made}"]
+            # Keep the transcript quiet: only surface a dim meta line when there
+            # is something noteworthy (tokens, tool calls, or degradation).
+            parts: list[str] = []
             if result.usage is not None and result.usage.total_tokens:
                 parts.append(f"{result.usage.total_tokens} tok")
+            if result.tool_calls_made:
+                parts.append(f"{result.tool_calls_made} tool calls")
             if result.degraded:
-                parts.append("degraded (local memory)")
-            for warning in result.warnings:
-                parts.append(warning)
-            self._write(f"[dim]{'  '.join(parts)}[/dim]")
+                parts.append("degraded · local memory")
+            if parts:
+                self._write(" · ".join(parts), "meta")
             self._finish_turn()
 
         def _turn_error(self, exc: Exception) -> None:
@@ -362,7 +386,7 @@ def make_app(
         def _finish_turn(self) -> None:
             self._turn_active = False
             self._current_md = None
-            self._refresh_status()
+            self._set_hint(_DEFAULT_HINT)
             prompt = self.query_one("#prompt", Input)
             prompt.disabled = False
             prompt.focus()
@@ -378,7 +402,8 @@ def make_app(
 
         def action_clear(self) -> None:
             self.query_one("#transcript", VerticalScroll).remove_children()
-            self._write("Transcript cleared.", "meta")
+            self._has_turns = False
+            self._write("cleared.", "meta")
 
     return RickshawTUI()
 

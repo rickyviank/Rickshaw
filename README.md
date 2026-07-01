@@ -67,11 +67,13 @@ rickshaw --provider openai --validate-only
 
 ### Terminal UI (`rickshaw-tui`)
 
-A full-screen terminal UI (built on [Textual](https://textual.textualize.io/)),
-in the spirit of Claude Code / Codex: a scrollable transcript, a pinned input at
-the bottom, a status bar (provider · model · effort), **streaming** replies
-rendered as Markdown, a "thinking" indicator, and slash-command autocomplete.
-Every turn is routed through the `Orchestrator`, so the semantic memory layer
+A deliberately minimalist full-screen terminal UI (built on
+[Textual](https://textual.textualize.io/)), in the spirit of Claude Code /
+Codex: a scrollable transcript with hairline rules between turns, a borderless
+pinned input, **streaming** replies rendered as Markdown, a faint "thinking"
+hint, and slash-command autocomplete. Near-monochrome with a single amber accent
+(the `›` marker on your messages) — no status bar or footer chrome. Every turn
+is routed through the `Orchestrator`, so the semantic memory layer
 (`remember`/`recall`/`forget`) and graceful-degradation info are active and
 surfaced.
 
@@ -89,8 +91,9 @@ rickshaw-tui --provider openai --effort high
   follow-up — the provider's `stream()` doesn't yet parse tool calls.)
 - **Memory** persists to a local SQLite file (`--db-path`, default
   `rickshaw_memory.db`) so context carries across sessions.
-- **Slash-commands:** `/help`, `/clear`, `/effort <level>`, `/model [name]`,
-  `/memory`, `/quit`. Type `/` for inline autocomplete.
+- **Slash-commands:** `/help`, `/status` (provider · model · effort), `/clear`,
+  `/effort <level>`, `/model [name]`, `/memory`, `/quit`. Type `/` for inline
+  autocomplete.
 - **Keys:** `Esc` interrupts an in-flight turn, `Ctrl+L` clears the transcript,
   `Ctrl+C` quits.
 
