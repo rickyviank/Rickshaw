@@ -10,15 +10,25 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 import httpx
 
 from rickshaw.memory.service import MemoryService
 from rickshaw.memory.tools import build_memory_registry
 from rickshaw.prompt.builder import PromptBuilder
-from rickshaw.providers.base import Effort, LLMProvider, Message, Response
+from rickshaw.providers.base import (
+    Effort,
+    LLMProvider,
+    Message,
+    Response,
+    TokenUsage,
+)
 from rickshaw.queue import Job, JobQueue, JobType
 from rickshaw.tool_registry import ToolRegistry
+
+# Callback invoked with incremental text as a turn's final answer is produced.
+StreamCallback = Callable[[str], None]
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +61,8 @@ class TurnResult:
     warnings: list[str] = field(default_factory=list)
     tool_calls_made: int = 0
     degraded: bool = False
+    model: str = ""
+    usage: TokenUsage | None = None
 
     def __str__(self) -> str:  # convenience for print()/logging
         return self.text
@@ -133,7 +145,11 @@ class Orchestrator:
                     continue
                 raise
 
-    def run_turn(self, task_input: str) -> TurnResult:
+    def run_turn(
+        self,
+        task_input: str,
+        on_delta: StreamCallback | None = None,
+    ) -> TurnResult:
         """Execute a single conversational turn.
 
         1. Assemble context from memory.
@@ -145,6 +161,15 @@ class Orchestrator:
         5. Write observations to memory.
         6. Enqueue deferred jobs (importance scoring).
         7. Return a :class:`TurnResult`.
+
+        If *on_delta* is provided it is called with incremental text as the
+        final answer is produced. When the provider supports streaming *and*
+        tools are not advertised (no function-calling), text is streamed token
+        by token via :meth:`LLMProvider.stream`. Otherwise the final text is
+        delivered as a single delta after generation (the tool-call loop can't
+        be streamed because tool-call parsing over the stream is provider work
+        that is deferred). Passing ``on_delta=None`` preserves the original
+        non-streaming behavior exactly.
         """
         warnings: list[str] = []
         ctx = self.memory.assemble_context(task_input)
@@ -164,6 +189,10 @@ class Orchestrator:
             context=ctx,
             task_input=task_input,
         )
+
+        # Real token streaming is only possible when we won't dispatch tools.
+        if on_delta is not None and caps.streaming and not use_tools:
+            return self._run_streaming_turn(messages, task_input, warnings, on_delta)
 
         try:
             response = self._complete_with_retry(messages, tool_specs)
@@ -228,9 +257,84 @@ class Orchestrator:
                 payload={"record_id": rec.id},
             ))
 
+        # Uniform streaming interface: deliver the final answer as one delta so
+        # callers that passed on_delta render through the same path.
+        if on_delta is not None and response.text:
+            on_delta(response.text)
+
         return TurnResult(
             text=response.text,
             warnings=warnings,
             tool_calls_made=tool_calls_made,
             degraded=False,
+            model=response.model,
+            usage=response.usage,
+        )
+
+    def _run_streaming_turn(
+        self,
+        messages: list[Message],
+        task_input: str,
+        warnings: list[str],
+        on_delta: StreamCallback,
+    ) -> TurnResult:
+        """Stream the final answer token by token (no tool dispatch path).
+
+        Transient errors are retried only before any text has been emitted;
+        once streaming has started we can't safely restart. On failure we
+        degrade to local recall, mirroring :meth:`run_turn`'s non-streaming
+        fallback.
+        """
+        parts: list[str] = []
+        attempt = 0
+        while True:
+            try:
+                for chunk in self.provider.stream(messages, effort=self.effort):
+                    parts.append(chunk)
+                    on_delta(chunk)
+                break
+            except Exception as exc:
+                if not parts and _is_transient_error(exc) and attempt < self.max_retries:
+                    delay = self.retry_backoff * (2 ** attempt)
+                    logger.warning(
+                        "Transient streaming error (attempt %d/%d), retrying in %.1fs: %s",
+                        attempt + 1, self.max_retries, delay, exc,
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
+                    attempt += 1
+                    continue
+                logger.warning("Streaming provider error: %s", exc)
+                warnings.append(_PROVIDER_UNREACHABLE_MSG)
+                if not parts:
+                    results = self.memory.recall(task_input)
+                    if results:
+                        text = (
+                            f"{_PROVIDER_UNREACHABLE_MSG}:\n"
+                            + "; ".join(r["text"] for r in results)
+                        )
+                    else:
+                        text = f"{_PROVIDER_UNREACHABLE_MSG} (no cached results found)."
+                    on_delta(text)
+                    return TurnResult(
+                        text=text, warnings=warnings, tool_calls_made=0, degraded=True,
+                    )
+                break
+
+        response = Response(
+            text="".join(parts), model=self.provider.name, effort=self.effort,
+        )
+        records = self.memory.write_observations(response)
+        for rec in records:
+            self.queue.enqueue(Job(
+                type=JobType.IMPORTANCE_SCORING,
+                payload={"record_id": rec.id},
+            ))
+        return TurnResult(
+            text=response.text,
+            warnings=warnings,
+            tool_calls_made=0,
+            degraded=False,
+            model=response.model,
+            usage=response.usage,
         )

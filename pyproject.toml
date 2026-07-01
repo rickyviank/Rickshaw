@@ -30,8 +30,10 @@ vector = [
 schema = [
     "jsonschema>=4.0.0",
 ]
-# Optional: Rich-based terminal UI (rickshaw-tui). Layered on the plain REPL.
+# Optional: full-screen terminal UI (rickshaw-tui), built on Textual.
+# Textual depends on Rich, so both are available with this extra.
 tui = [
+    "textual>=0.50",
     "rich>=13.0",
 ]
 

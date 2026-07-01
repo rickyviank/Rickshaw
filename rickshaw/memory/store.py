@@ -48,7 +48,10 @@ class MemoryStore:
         vector_dim: int | None = None,
         use_vector_index: bool = True,
     ) -> None:
-        self._conn = sqlite3.connect(str(db_path))
+        # check_same_thread=False lets a serialized caller (e.g. the TUI, which
+        # runs each turn in an exclusive worker thread) reuse the connection
+        # across threads. Access is expected to be serialized by the caller.
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_SCHEMA)
         self._conn.commit()
