@@ -92,10 +92,17 @@ class DeferredWorker:
             )
             score = float(response.text.strip())
             record.importance = min(max(score, 0.0), 1.0)
-        except (ValueError, TypeError):
+        except Exception as exc:
+            # Fallback: assign a neutral score so downstream ranking still
+            # works, but log the error and tag the record so callers can
+            # distinguish a real score from a fabricated one.
+            logger.warning(
+                "Importance scoring failed for record %s, "
+                "falling back to 0.5: %s",
+                record_id, exc,
+            )
             record.importance = 0.5
-        except Exception:
-            record.importance = 0.5
+            record.extra["importance_fallback"] = True
         self.memory.store.update(record)
 
     def _compact(self, job: Job) -> None:
@@ -122,10 +129,14 @@ class DeferredWorker:
                     effort=Effort.LOW,
                 )
                 summary = response.text.strip()
-            except Exception:
-                summary = combined_text[:200]
+            except Exception as exc:
+                logger.warning(
+                    "Compaction summarization failed, falling back to "
+                    "truncated text: %s", exc,
+                )
+                summary = "[truncated] " + combined_text[:200]
         else:
-            summary = combined_text[:200]
+            summary = "[truncated] " + combined_text[:200]
 
         new_record = self.memory.write(
             text=summary,

@@ -146,7 +146,8 @@ def test_main_wiring_constructs_orchestrator(mock_config, mock_build):
 
 @patch("rickshaw.tui._build_provider")
 @patch("rickshaw.tui.load_config")
-def test_main_survives_validation_failure(mock_config, mock_build):
+def test_main_validation_failure_exits(mock_config, mock_build):
+    """Validation failure exits non-zero by default (no --allow-unvalidated)."""
     from rickshaw.config import RickshawConfig
 
     mock_config.return_value = RickshawConfig()
@@ -154,8 +155,23 @@ def test_main_survives_validation_failure(mock_config, mock_build):
     provider.validate = MagicMock(side_effect=ValueError("bad key"))
     mock_build.return_value = provider
 
-    with patch("rickshaw.tui._run_app") as mock_run:
+    with pytest.raises(SystemExit):
         tui.main(["--provider", "fake", "--db-path", ":memory:"])
+
+
+@patch("rickshaw.tui._run_app")
+@patch("rickshaw.tui._build_provider")
+@patch("rickshaw.tui.load_config")
+def test_main_allow_unvalidated_continues(mock_config, mock_build, mock_run):
+    """--allow-unvalidated lets the app launch despite validation failure."""
+    from rickshaw.config import RickshawConfig
+
+    mock_config.return_value = RickshawConfig()
+    provider = _FakeProvider()
+    provider.validate = MagicMock(side_effect=ValueError("bad key"))
+    mock_build.return_value = provider
+
+    tui.main(["--provider", "fake", "--db-path", ":memory:", "--allow-unvalidated"])
 
     mock_run.assert_called_once()
 
@@ -794,17 +810,78 @@ async def test_app_settings_offline_error_aborts():
     )
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/settings"
-        await pilot.press("enter")
-        await pilot.pause()
+    # Patch build_provider_from_profile so the /settings wizard also gets an
+    # offline provider (by default it constructs a real OpenAI provider which
+    # may succeed via disk-cached models).
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/settings"
+            await pilot.press("enter")
+            await pilot.pause()
 
-        # Pick the fake provider — should fail since models can't be fetched.
-        app.query_one("#prompt").value = "fake"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "Cannot list models" in rendered
+            # Pick the fake provider — should fail since models can't be fetched.
+            app.query_one("#prompt").value = "fake"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = " ".join(
+                str(w.render())
+                for w in app.query_one("#transcript").query("Static")
+            )
+            assert "Cannot list models" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_model_error_is_logged(caplog):
+    """Exception details from /model are logged, not just shown in the TUI."""
+    pytest.importorskip("textual")
+
+    class _OfflineProvider(_FakeProvider):
+        def available_models(self):
+            raise RuntimeError("offline — no cached model list")
+
+    provider = _OfflineProvider()
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory)
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with caplog.at_level("ERROR"):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/model"
+            await pilot.press("enter")
+            await pilot.pause()
+
+    assert any("Failed to list models" in m for m in caplog.messages)
+
+
+@pytest.mark.asyncio
+async def test_app_provider_switch_error_is_logged(caplog):
+    """Exception details from /provider switch are logged."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    cfg.providers["broken"] = ProviderProfile(
+        base_url="", model="",
+        api_key_env="BROKEN_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    def _raise(*a, **kw):
+        raise ValueError("provider construction failed")
+
+    with caplog.at_level("ERROR"), \
+         patch("rickshaw.tui.build_provider_from_profile", side_effect=_raise):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/provider broken"
+            await pilot.press("enter")
+            await pilot.pause()
+
+    assert any("Failed to switch provider" in m for m in caplog.messages)

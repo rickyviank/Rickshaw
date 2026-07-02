@@ -38,6 +38,10 @@ class ProviderProfile:
     api_key_env: str
     wire_format: str = "openai"
 
+    def has_api_key(self) -> bool:
+        """Return ``True`` when the configured env var holds a non-empty key."""
+        return bool(os.environ.get(self.api_key_env, ""))
+
     def is_local_endpoint(self) -> bool:
         """Return ``True`` when *base_url* points at a loopback or private host.
 

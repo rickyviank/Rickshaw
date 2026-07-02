@@ -91,3 +91,31 @@ def test_build_returns_list_of_messages():
 def test_estimate_tokens_positive():
     assert _estimate_tokens("hello world") > 0
     assert _estimate_tokens("") >= 1
+
+
+def test_estimate_tokens_fallback_logs_warning(caplog):
+    """The tiktoken fallback emits a one-time warning."""
+    import rickshaw.prompt.builder as builder_mod
+
+    # Reset the warning flag so we can observe it.
+    builder_mod._TIKTOKEN_WARNED = False
+    with caplog.at_level("WARNING"):
+        # Force the fallback by patching tiktoken out.
+        import sys
+        original = sys.modules.get("tiktoken")
+        sys.modules["tiktoken"] = None  # type: ignore[assignment]
+        try:
+            result = _estimate_tokens("hello world")
+            assert result > 0
+            assert any("tiktoken unavailable" in m for m in caplog.messages)
+
+            # Second call should NOT log again.
+            caplog.clear()
+            _estimate_tokens("another call")
+            assert not any("tiktoken unavailable" in m for m in caplog.messages)
+        finally:
+            if original is not None:
+                sys.modules["tiktoken"] = original
+            else:
+                sys.modules.pop("tiktoken", None)
+            builder_mod._TIKTOKEN_WARNED = False

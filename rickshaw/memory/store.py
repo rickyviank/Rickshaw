@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS memories (
     last_used_at TEXT NOT NULL,
     use_count INTEGER NOT NULL DEFAULT 0,
     sensitive INTEGER NOT NULL DEFAULT 0,
-    superseded_by TEXT
+    superseded_by TEXT,
+    extra TEXT NOT NULL DEFAULT '{}'
 );
 """
 
@@ -55,6 +56,7 @@ class MemoryStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_SCHEMA)
         self._conn.commit()
+        self._migrate()
 
         # Optional indexed vector search via ChromaDB. SQLite stays the source
         # of truth; the index mirrors embeddings for KNN. Falls back to a
@@ -66,6 +68,18 @@ class MemoryStore:
             index = ChromaVectorIndex(db_path, vector_dim)
             if index.enabled:
                 self._index = index
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema."""
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        if "extra" not in cols:
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN extra TEXT NOT NULL DEFAULT '{}'"
+            )
+            self._conn.commit()
 
     @property
     def vector_search_enabled(self) -> bool:
@@ -82,8 +96,9 @@ class MemoryStore:
         self._conn.execute(
             """INSERT OR REPLACE INTO memories
                (id, text, embedding, scope, type, importance,
-                created_at, last_used_at, use_count, sensitive, superseded_by)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_at, last_used_at, use_count, sensitive, superseded_by,
+                extra)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record.id,
                 record.text,
@@ -96,6 +111,7 @@ class MemoryStore:
                 record.use_count,
                 int(record.sensitive),
                 record.superseded_by,
+                json.dumps(record.extra),
             ),
         )
         self._conn.commit()
@@ -229,4 +245,5 @@ class MemoryStore:
             use_count=row["use_count"],
             sensitive=bool(row["sensitive"]),
             superseded_by=row["superseded_by"],
+            extra=json.loads(row["extra"]) if row["extra"] else {},
         )

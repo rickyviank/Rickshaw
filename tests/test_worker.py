@@ -162,6 +162,76 @@ def test_worker_compaction():
     assert memory.store.get(r1.id).superseded_by is not None
 
 
+def test_worker_importance_fallback_logs_and_marks(caplog):
+    """When scoring fails, a warning is logged and the record is tagged."""
+    class _BadScoreProvider(_StubProvider):
+        def complete(self, messages, effort=Effort.MEDIUM, tools=None, **kw):
+            raise ValueError("cannot parse score")
+
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    rec = memory.write("some fact")
+    assert rec is not None
+    queue = JobQueue()
+    queue.enqueue(Job(type=JobType.IMPORTANCE_SCORING, payload={"record_id": rec.id}))
+
+    worker = DeferredWorker(queue=queue, memory=memory, provider=_BadScoreProvider())
+    with caplog.at_level("WARNING"):
+        worker.process_batch()
+
+    updated = memory.store.get(rec.id)
+    assert updated is not None
+    assert updated.importance == 0.5
+    assert updated.extra.get("importance_fallback") is True
+    assert any("Importance scoring failed" in m for m in caplog.messages)
+
+
+def test_worker_compaction_fallback_prefixes_truncated(caplog):
+    """When compaction summarization fails, the fallback is prefixed."""
+    class _BadSummaryProvider(_StubProvider):
+        def complete(self, messages, effort=Effort.MEDIUM, tools=None, **kw):
+            raise RuntimeError("summarization error")
+
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    r1 = memory.write("fact A")
+    r2 = memory.write("fact B about something else")
+    assert r1 is not None and r2 is not None
+
+    queue = JobQueue()
+    queue.enqueue(Job(
+        type=JobType.COMPACTION,
+        payload={"record_ids": [r1.id, r2.id]},
+    ))
+    worker = DeferredWorker(queue=queue, memory=memory, provider=_BadSummaryProvider())
+    with caplog.at_level("WARNING"):
+        worker.process_batch()
+
+    # The compacted record should start with the truncation marker.
+    all_recs = memory.store.all_records()
+    compacted = [r for r in all_recs if r.text.startswith("[truncated]")]
+    assert len(compacted) == 1
+    assert any("Compaction summarization failed" in m for m in caplog.messages)
+
+
+def test_worker_compaction_no_provider_prefixes_truncated():
+    """Without a provider, compaction uses truncated text with prefix."""
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    r1 = memory.write("fact A")
+    r2 = memory.write("fact B about something else")
+    assert r1 is not None and r2 is not None
+
+    queue = JobQueue()
+    queue.enqueue(Job(
+        type=JobType.COMPACTION,
+        payload={"record_ids": [r1.id, r2.id]},
+    ))
+    worker = DeferredWorker(queue=queue, memory=memory, provider=None)
+    worker.process_batch()
+
+    all_recs = memory.store.all_records()
+    compacted = [r for r in all_recs if r.text.startswith("[truncated]")]
+    assert len(compacted) == 1
+
+
 def test_worker_handles_missing_record():
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     queue = JobQueue()

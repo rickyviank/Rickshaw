@@ -46,3 +46,4 @@ class MemoryRecord:
     use_count: int = 0
     sensitive: bool = False
     superseded_by: str | None = None
+    extra: dict = field(default_factory=dict)

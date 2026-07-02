@@ -99,3 +99,49 @@ def test_main_validate_only_failure(mock_config, mock_build):
 
     with pytest.raises(SystemExit):
         main(["--validate-only"])
+
+
+@patch("rickshaw.tui._build_provider")
+@patch("rickshaw.tui.load_config")
+def test_main_validation_failure_exits_by_default(mock_config, mock_build):
+    """Without --allow-unvalidated, validation failure exits non-zero."""
+    from rickshaw.config import RickshawConfig
+    from rickshaw.tui import main
+
+    mock_config.return_value = RickshawConfig()
+    provider = MagicMock()
+    provider.name = "openai"
+    provider.validate.side_effect = ValueError("bad key")
+    mock_build.return_value = provider
+
+    with pytest.raises(SystemExit):
+        main(["--provider", "openai"])
+
+
+@patch("rickshaw.tui._run_app")
+@patch("rickshaw.tui._build_provider")
+@patch("rickshaw.tui.load_config")
+def test_main_allow_unvalidated_continues(mock_config, mock_build, mock_run):
+    """--allow-unvalidated lets the app launch despite validation failure."""
+    from rickshaw.config import RickshawConfig
+    from rickshaw.tui import main
+
+    mock_config.return_value = RickshawConfig()
+    provider = MagicMock()
+    provider.name = "openai"
+    provider.validate.side_effect = ValueError("bad key")
+    mock_build.return_value = provider
+
+    main(["--provider", "openai", "--allow-unvalidated", "--db-path", ":memory:"])
+
+    mock_run.assert_called_once()
+
+
+def test_parse_allow_unvalidated_flag():
+    from rickshaw.tui import _parse_args
+
+    args = _parse_args(["--allow-unvalidated"])
+    assert args.allow_unvalidated is True
+
+    args = _parse_args([])
+    assert args.allow_unvalidated is False

@@ -8,17 +8,30 @@ remaining job is to cap the total prompt size to *max_tokens*.
 
 from __future__ import annotations
 
+import logging
+
 from rickshaw.memory.record import MemoryRecord
 from rickshaw.providers.base import Message, ToolSpec
+
+logger = logging.getLogger(__name__)
+
+_TIKTOKEN_WARNED = False
 
 
 def _estimate_tokens(text: str) -> int:
     """Simple token estimate: ~4 chars per token, fallback heuristic."""
+    global _TIKTOKEN_WARNED
     try:
         import tiktoken
         enc = tiktoken.encoding_for_model("gpt-4o")
         return len(enc.encode(text))
     except Exception:
+        if not _TIKTOKEN_WARNED:
+            logger.warning(
+                "tiktoken unavailable; falling back to len//4 heuristic "
+                "for token estimation. Install tiktoken for accurate counts."
+            )
+            _TIKTOKEN_WARNED = True
         return max(1, len(text) // 4)
 
 
