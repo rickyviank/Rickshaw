@@ -476,8 +476,8 @@ def make_app(
         def _cmd_engine_add_start(self) -> None:
             """Begin the interactive engine-registration wizard."""
             self._engine_add_state = {"step": 0, "data": {}}
-            self._write(_ENGINE_ADD_STEPS[0][1], "meta")
-            self._set_hint("type a value and press Enter (Esc to cancel)")
+            _key, prompt = _ENGINE_ADD_STEPS[0]
+            self._set_hint(f"{prompt}(Enter to submit, Esc to cancel)")
 
         def _engine_add_step(self, value: str) -> None:
             """Process one step of the engine-add wizard."""
@@ -485,7 +485,7 @@ def make_app(
             if state is None:
                 return
             step_idx = state["step"]
-            key, _prompt = _ENGINE_ADD_STEPS[step_idx]
+            key, prompt_text = _ENGINE_ADD_STEPS[step_idx]
 
             # Apply default for wire_format.
             if key == "wire_format" and not value:
@@ -497,12 +497,17 @@ def make_app(
                 self._write(_ENGINE_ADD_STEPS[step_idx][1], "meta")
                 return
 
+            # Echo the user's input next to the prompt so the transcript
+            # reads like a CLI conversation.
+            self._write(f"{prompt_text}{value}", "meta")
+
             state["data"][key] = value
             step_idx += 1
             state["step"] = step_idx
 
             if step_idx < len(_ENGINE_ADD_STEPS):
-                self._write(_ENGINE_ADD_STEPS[step_idx][1], "meta")
+                _next_key, next_prompt = _ENGINE_ADD_STEPS[step_idx]
+                self._set_hint(f"{next_prompt}(Enter to submit, Esc to cancel)")
             else:
                 self._engine_add_finish(state["data"])
 
