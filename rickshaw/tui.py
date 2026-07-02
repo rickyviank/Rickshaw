@@ -191,7 +191,7 @@ def make_app(
                 "embedding_model", self._cfg.openai_embedding_model,
             )
 
-            with Vertical(id="settings-container"):
+            with VerticalScroll(id="settings-container"):
                 yield Label("Settings", classes="section-title")
 
                 yield Label("Provider")
