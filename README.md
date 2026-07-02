@@ -100,9 +100,14 @@ surfaced.
 - **Keys:** `Esc` interrupts an in-flight turn, `Ctrl+L` clears the transcript,
   `Ctrl+C` quits.
 
-### `/settings` and `/provider` commands
+### `/settings` — interactive provider/model picker
 
-Type `/settings` inside the TUI to display current settings (read-only):
+`/settings` shows current settings then launches an interactive two-step wizard:
+
+1. **Pick a provider** — lists all configured providers (from
+   `~/.rickshaw/settings.json` and builtins) with the active one marked.
+2. **Pick a model** — lists the chosen provider's `available_models()` with the
+   active model marked; selecting one applies the switch immediately.
 
 ```
 Settings
@@ -111,23 +116,30 @@ Settings
   model            gpt-4o
   effort           medium
   embedding        openai / text-embedding-3-small
-
-  Use:
-    /provider <name>          switch provider
-    /provider                 list available providers
-    /model <name>             switch chat model
-    /effort <low|medium|high> set reasoning effort
-    /provider add             register a custom provider
 ────────────────────────────────────────────
+
+  Pick a provider (enter name, Esc to cancel):
+    anthropic
+    devin
+    openai           ♦
 ```
+
+Press `Esc` at any step to cancel.
+
+If the chosen provider does not support the current effort level, effort is
+automatically reset to `medium` and a warning is shown.
+
+### `/models` — list available models
+
+`/models` non-interactively lists the **current** provider's `available_models()`
+with the active one marked — a quick discoverability shortcut.
+
+### `/provider` command
 
 Use `/provider` to list available providers, `/provider <name>` to switch, or
 `/provider add` to register a custom OpenAI-compatible endpoint step by step.
 The deprecated `/engine` alias still works for backward compatibility.
 Changes are saved to `~/.rickshaw/settings.json` and take effect immediately.
-
-If you switch to a provider that does not support the current effort level,
-effort is automatically reset to `medium` and a warning is shown.
 
 ### Persistent settings (`~/.rickshaw/settings.json`)
 

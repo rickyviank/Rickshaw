@@ -41,7 +41,8 @@ _DEFAULT_DB_PATH = "rickshaw_memory.db"
 _COMMANDS = {
     "/help": "Show this help.",
     "/status": "Show provider, model, and effort.",
-    "/settings": "Show current settings and usage hints.",
+    "/settings": "Interactive provider/model picker (also shows current settings).",
+    "/models": "List the current provider's available models.",
     "/clear": "Clear the transcript.",
     "/provider": "/provider [name|add] -- show, switch, or register a provider.",
     "/effort": "/effort <low|medium|high> -- set reasoning effort.",
@@ -206,6 +207,7 @@ def make_app(
             self._turn_active = False
             self._has_turns = False
             self._provider_add_state: dict | None = None
+            self._settings_state: dict | None = None
 
         # ---- layout -----------------------------------------------------
 
@@ -261,7 +263,10 @@ def make_app(
         def on_input_submitted(self, event: Input.Submitted) -> None:
             value = event.value.strip()
             event.input.value = ""
-            # Provider-add wizard intercepts all input while active.
+            # Wizard intercepts all input while active.
+            if self._settings_state is not None:
+                self._settings_step(value)
+                return
             if self._provider_add_state is not None:
                 self._provider_add_step(value)
                 return
@@ -294,6 +299,8 @@ def make_app(
                 self._cmd_model(arg)
             elif cmd == "/settings":
                 self._cmd_settings()
+            elif cmd == "/models":
+                self._cmd_models()
             elif cmd in ("/provider", "/engine"):
                 self._cmd_provider(arg)
             elif cmd == "/memory":
@@ -414,8 +421,25 @@ def make_app(
                 snippet = rec.text if len(rec.text) <= 100 else rec.text[:97] + "…"
                 self._write(f"  {snippet}", "meta")
 
+        def _cmd_models(self) -> None:
+            """Non-interactive list of the current provider's models."""
+            model = getattr(self.provider, "_model", "") or "(unknown)"
+            self._write(
+                f"current \u00b7 {self.provider.name} ({model})", "meta",
+            )
+            self._write("", "meta")
+            try:
+                models = self.provider.available_models()
+            except Exception as exc:
+                self._write(f"Cannot list models: {exc}", "warn")
+                return
+            self._write("  available models:", "meta")
+            for m in models:
+                marker = "\u2666" if m == model else " "
+                self._write(f"    {m:<32} {marker}", "meta")
+
         def _cmd_settings(self) -> None:
-            """Read-only display of current settings + usage hints."""
+            """Interactive provider/model picker with settings header."""
             model = getattr(self.provider, "_model", "") or self.provider.name
             settings = load_settings()
             emb_prov = settings.get(
@@ -432,17 +456,141 @@ def make_app(
                 f"  model            {model}",
                 f"  effort           {self.orchestrator.effort.value}",
                 f"  embedding        {emb_prov} / {emb_model}",
-                "",
-                "  Use:",
-                "    /provider <name>          switch provider",
-                "    /provider                 list available providers",
-                "    /model <name>             switch chat model",
-                "    /effort <low|medium|high> set reasoning effort",
-                "    /provider add             register a custom provider",
                 "\u2500" * 44,
             ]
             for line in lines:
                 self._write(line, "meta")
+
+            # Step 1: list providers and prompt the user to pick one.
+            provider_names = sorted(self.cfg.providers)
+            if not provider_names:
+                self._write("No providers configured.", "warn")
+                return
+            self._write("", "meta")
+            self._write("  Pick a provider (enter name, Esc to cancel):", "meta")
+            for name in provider_names:
+                marker = "\u2666" if name == self.provider.name else " "
+                self._write(f"    {name:<16} {marker}", "meta")
+            self._settings_state = {"step": "provider", "providers": provider_names}
+            self._set_hint("provider name (Enter to submit, Esc to cancel)")
+
+        def _settings_step(self, value: str) -> None:
+            """Process one step of the interactive /settings wizard."""
+            state = self._settings_state
+            if state is None:
+                return
+
+            if state["step"] == "provider":
+                if not value:
+                    self._write("(cancelled)", "warn")
+                    self._settings_state = None
+                    self._set_hint(_DEFAULT_HINT)
+                    return
+                chosen = value.strip()
+                if chosen not in self.cfg.providers:
+                    available = ", ".join(state["providers"])
+                    self._write(
+                        f"Unknown provider {chosen!r}. Available: {available}",
+                        "warn",
+                    )
+                    return
+                self._write(f"  provider: {chosen}", "meta")
+
+                # Build a temporary provider to list its models.
+                profile = self.cfg.providers[chosen]
+                try:
+                    temp = build_provider_from_profile(
+                        chosen, profile,
+                        embedding_model=self.cfg.openai_embedding_model,
+                    )
+                    models = temp.available_models()
+                except Exception as exc:
+                    self._write(f"Cannot list models for {chosen}: {exc}", "warn")
+                    self._settings_state = None
+                    self._set_hint(_DEFAULT_HINT)
+                    return
+
+                if not models:
+                    self._write(f"No models available for {chosen}.", "warn")
+                    self._settings_state = None
+                    self._set_hint(_DEFAULT_HINT)
+                    return
+
+                current_model = (
+                    getattr(self.provider, "_model", "")
+                    if chosen == self.provider.name
+                    else ""
+                )
+                self._write("", "meta")
+                self._write("  Pick a model (enter name, Esc to cancel):", "meta")
+                for m in models:
+                    marker = "\u2666" if m == current_model else " "
+                    self._write(f"    {m:<32} {marker}", "meta")
+                state["step"] = "model"
+                state["chosen_provider"] = chosen
+                state["valid_models"] = models
+                self._set_hint("model name (Enter to submit, Esc to cancel)")
+
+            elif state["step"] == "model":
+                if not value:
+                    self._write("(cancelled)", "warn")
+                    self._settings_state = None
+                    self._set_hint(_DEFAULT_HINT)
+                    return
+                model_name = value.strip()
+                valid_models = state["valid_models"]
+                chosen_provider = state["chosen_provider"]
+                if model_name not in valid_models:
+                    display = ", ".join(valid_models)
+                    self._write(
+                        f"Unknown model {model_name!r}. Available: {display}",
+                        "warn",
+                    )
+                    return
+                self._write(f"  model: {model_name}", "meta")
+
+                # Apply the provider + model switch.
+                self._settings_apply(chosen_provider, model_name)
+                self._settings_state = None
+                self._set_hint(_DEFAULT_HINT)
+
+        def _settings_apply(self, provider_name: str, model_name: str) -> None:
+            """Apply provider + model selection from /settings wizard."""
+            profile = self.cfg.providers[provider_name]
+            try:
+                new_provider = _rebuild_provider(
+                    provider_name, self.cfg, model_name,
+                )
+            except Exception as exc:
+                self._write(f"Cannot switch: {exc}", "warn")
+                return
+            self.provider = new_provider
+            self.orchestrator.provider = new_provider
+
+            # Effort reconciliation.
+            caps = new_provider.capabilities()
+            old_effort = self.orchestrator.effort
+            if caps.effort_levels and old_effort not in caps.effort_levels:
+                default_effort = Effort.MEDIUM
+                self.orchestrator.effort = default_effort
+                self.effort = default_effort
+                self._write(
+                    f"note: {provider_name} does not support effort "
+                    f"{old_effort.value}. Reset to medium.",
+                    "warn",
+                )
+
+            settings = load_settings()
+            settings["provider"] = provider_name
+            settings["model"] = model_name
+            settings["effort"] = self.orchestrator.effort.value
+            save_settings(settings)
+
+            self._write(
+                f"{provider_name} \u00b7 {model_name} \u00b7 effort "
+                f"{self.orchestrator.effort.value}",
+                "meta",
+            )
 
         def _cmd_provider(self, arg: str) -> None:
             """Show, switch, or register providers."""
@@ -651,6 +799,11 @@ def make_app(
         # ---- actions ----------------------------------------------------
 
         def action_interrupt(self) -> None:
+            if self._settings_state is not None:
+                self._settings_state = None
+                self._write("(cancelled)", "warn")
+                self._set_hint(_DEFAULT_HINT)
+                return
             if self._provider_add_state is not None:
                 self._provider_add_state = None
                 self._write("(cancelled)", "warn")

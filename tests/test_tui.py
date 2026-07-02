@@ -248,11 +248,16 @@ async def test_app_effort_command_updates_orchestrator():
 
 
 @pytest.mark.asyncio
-async def test_app_settings_command_read_only():
-    """``/settings`` prints an inline display without opening a modal."""
+async def test_app_settings_command_shows_header():
+    """``/settings`` prints settings header and starts the interactive picker."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
-    app = tui.make_app(orch, provider, Effort.MEDIUM)
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
     async with app.run_test() as pilot:
         app.query_one("#prompt").value = "/settings"
@@ -264,7 +269,7 @@ async def test_app_settings_command_read_only():
         )
         assert "Settings" in rendered
         assert "provider" in rendered
-        assert "/provider" in rendered
+        assert "Pick a provider" in rendered
 
 
 @pytest.mark.asyncio
@@ -578,3 +583,228 @@ async def test_app_engine_alias_still_works():
             for w in app.query_one("#transcript").query("Static")
         )
         assert "available providers" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_settings_interactive_picker():
+    """``/settings`` starts an interactive wizard: pick provider, then model."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui._rebuild_provider", return_value=provider), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/settings"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = " ".join(
+                str(w.render())
+                for w in app.query_one("#transcript").query("Static")
+            )
+            assert "Settings" in rendered
+            assert "Pick a provider" in rendered
+
+            # Step 1: pick the "fake" provider.
+            app.query_one("#prompt").value = "fake"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = " ".join(
+                str(w.render())
+                for w in app.query_one("#transcript").query("Static")
+            )
+            assert "Pick a model" in rendered
+            assert "fake-model" in rendered
+
+            # Step 2: pick the "fake-model" model.
+            app.query_one("#prompt").value = "fake-model"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = " ".join(
+                str(w.render())
+                for w in app.query_one("#transcript").query("Static")
+            )
+            assert "fake · fake-model" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_settings_rejects_unknown_provider():
+    """``/settings`` rejects an unknown provider name."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/settings"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        app.query_one("#prompt").value = "nonexistent"
+        await pilot.press("enter")
+        await pilot.pause()
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static")
+        )
+        assert "Unknown provider" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_settings_rejects_unknown_model():
+    """``/settings`` rejects an unknown model in step 2."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/settings"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            # Pick the fake provider.
+            app.query_one("#prompt").value = "fake"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            # Try an invalid model.
+            app.query_one("#prompt").value = "bad-model"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = " ".join(
+                str(w.render())
+                for w in app.query_one("#transcript").query("Static")
+            )
+            assert "Unknown model" in rendered
+            assert "fake-model" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_settings_cancel_at_provider_step():
+    """Pressing Esc cancels /settings at the provider step."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/settings"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        await pilot.press("escape")
+        await pilot.pause()
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static")
+        )
+        assert "(cancelled)" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_models_command():
+    """``/models`` lists the current provider's models."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/models"
+        await pilot.press("enter")
+        await pilot.pause()
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static")
+        )
+        assert "available models" in rendered
+        assert "fake-model" in rendered
+        assert "♦" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_models_offline_error():
+    """``/models`` surfaces an error if available_models() raises."""
+    pytest.importorskip("textual")
+
+    class _OfflineProvider(_FakeProvider):
+        def available_models(self):
+            raise RuntimeError("offline — no cached model list")
+
+    provider = _OfflineProvider()
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory)
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/models"
+        await pilot.press("enter")
+        await pilot.pause()
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static")
+        )
+        assert "Cannot list models" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_settings_offline_error_aborts():
+    """``/settings`` aborts gracefully if available_models() raises."""
+    pytest.importorskip("textual")
+
+    class _OfflineProvider(_FakeProvider):
+        def available_models(self):
+            raise RuntimeError("offline — no cached model list")
+
+    provider = _OfflineProvider()
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory)
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/settings"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        # Pick the fake provider — should fail since models can't be fetched.
+        app.query_one("#prompt").value = "fake"
+        await pilot.press("enter")
+        await pilot.pause()
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static")
+        )
+        assert "Cannot list models" in rendered
