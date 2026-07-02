@@ -92,21 +92,40 @@ surfaced.
   follow-up — the provider's `stream()` doesn't yet parse tool calls.)
 - **Memory** persists to a local SQLite file (`--db-path`, default
   `rickshaw_memory.db`) so context carries across sessions.
-- **Slash-commands:** `/help`, `/status` (provider · model · effort), `/settings`
-  (open settings panel), `/clear`, `/effort <level>`, `/model [name]`, `/memory`,
-  `/quit`. Type `/` for inline autocomplete.
+- **Slash-commands:** `/help`, `/status` (engine · model · effort), `/settings`
+  (show current settings), `/engine [name|add]` (list, switch, or register an
+  engine), `/clear`, `/effort <level>`, `/model [name]`, `/memory`, `/quit`.
+  Type `/` for inline autocomplete.
 - **Keys:** `Esc` interrupts an in-flight turn, `Ctrl+L` clears the transcript,
   `Ctrl+C` quits.
 
-### `/settings` command
+### `/settings` and `/engine` commands
 
-Type `/settings` inside the TUI to open the settings panel:
+Type `/settings` inside the TUI to display current settings (read-only):
 
-- **Basic scope:** choose the active provider, chat model, and effort level.
-- **Advanced scope:** add or edit a custom provider (name, base URL, API key
-  env var, wire format), plus set the embedding provider and embedding model.
+```
+Settings
+────────────────────────────────────────────
+  engine           openai
+  model            gpt-4o
+  effort           medium
+  embedding        openai / text-embedding-3-small
 
+  Use:
+    /engine <name>            switch engine
+    /engine                   list available engines
+    /model <name>             switch chat model
+    /effort <low|medium|high> set reasoning effort
+    /engine add               register a custom engine
+────────────────────────────────────────────
+```
+
+Use `/engine` to list available engines, `/engine <name>` to switch, or
+`/engine add` to register a custom OpenAI-compatible endpoint step by step.
 Changes are saved to `~/.rickshaw/settings.json` and take effect immediately.
+
+If you switch to an engine that does not support the current effort level,
+effort is automatically reset to `medium` and a warning is shown.
 
 ### Persistent settings (`~/.rickshaw/settings.json`)
 

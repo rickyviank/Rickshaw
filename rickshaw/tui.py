@@ -40,9 +40,10 @@ _DEFAULT_DB_PATH = "rickshaw_memory.db"
 # Slash-commands, used for help text and inline autocomplete.
 _COMMANDS = {
     "/help": "Show this help.",
-    "/status": "Show provider, model, and effort.",
-    "/settings": "Open the settings panel.",
+    "/status": "Show engine, model, and effort.",
+    "/settings": "Show current settings and usage hints.",
     "/clear": "Clear the transcript.",
+    "/engine": "/engine [name|add] -- show, switch, or register an engine.",
     "/effort": "/effort <low|medium|high> -- set reasoning effort.",
     "/model": "/model [name] -- show or switch the chat model.",
     "/memory": "List recently stored memories.",
@@ -127,171 +128,22 @@ def make_app(
         from textual import work
         from textual.app import App, ComposeResult
         from textual.binding import Binding
-        from textual.containers import Vertical, VerticalScroll
-        from textual.screen import ModalScreen
+        from textual.containers import VerticalScroll
         from textual.suggester import SuggestFromList
-        from textual.widgets import (
-            Button,
-            Input,
-            Label,
-            Markdown,
-            Rule,
-            Select,
-            Static,
-        )
+        from textual.widgets import Input, Markdown, Rule, Static
     except ImportError as exc:  # pragma: no cover - exercised via message text
         raise SystemExit(_TEXTUAL_MISSING_MSG) from exc
 
     cfg = cfg or RickshawConfig()
 
-    # ---- Settings modal screen -----------------------------------------
+    # ---- Engine-add wizard steps ----------------------------------------
 
-    class SettingsScreen(ModalScreen):
-        """Modal for viewing / editing runtime settings."""
-
-        CSS = """
-        SettingsScreen { align: center middle; }
-        #settings-container {
-            width: 70;
-            max-height: 36;
-            background: #1a1b1e;
-            border: solid #3a3f47;
-            padding: 1 2;
-        }
-        #settings-container Label { margin: 1 0 0 0; color: #9aa0a8; }
-        #settings-container Select { margin: 0 0 1 0; }
-        #settings-container Input { margin: 0 0 1 0; }
-        #settings-container Button { margin: 1 1 0 0; }
-        .section-title { color: #d98a3d; text-style: bold; margin: 1 0 0 0; }
-        """
-
-        BINDINGS = [
-            Binding("escape", "dismiss_settings", "Close", show=False),
-        ]
-
-        def __init__(self, app_cfg: RickshawConfig) -> None:
-            super().__init__()
-            self._cfg = app_cfg
-            self._advanced = False
-
-        def compose(self) -> ComposeResult:
-            provider_choices = [
-                (name, name) for name in sorted(self._cfg.providers)
-            ]
-            settings = load_settings()
-            current_provider = settings.get("provider", self._cfg.provider)
-            current_effort = settings.get("effort", self._cfg.effort.value)
-            effort_choices = [
-                ("low", "low"), ("medium", "medium"), ("high", "high"),
-            ]
-            current_emb_provider = settings.get(
-                "embedding_provider", self._cfg.embedding_provider or "openai",
-            )
-            current_emb_model = settings.get(
-                "embedding_model", self._cfg.openai_embedding_model,
-            )
-
-            with VerticalScroll(id="settings-container"):
-                yield Label("Settings", classes="section-title")
-
-                yield Label("Provider")
-                yield Select(
-                    provider_choices,
-                    value=current_provider,
-                    id="sel-provider",
-                )
-
-                yield Label("Chat model")
-                profile = self._cfg.providers.get(current_provider)
-                default_model = profile.model if profile else ""
-                yield Input(
-                    value=default_model,
-                    placeholder="model name",
-                    id="inp-model",
-                )
-
-                yield Label("Effort")
-                yield Select(
-                    effort_choices,
-                    value=current_effort,
-                    id="sel-effort",
-                )
-
-                # Advanced section (always rendered, toggled by button)
-                yield Label("Advanced", classes="section-title", id="lbl-advanced")
-
-                yield Label("Add / edit provider", id="lbl-adv-header")
-                yield Label("Name", id="lbl-adv-name")
-                yield Input(placeholder="e.g. deepseek", id="inp-adv-name")
-                yield Label("Base URL", id="lbl-adv-url")
-                yield Input(placeholder="https://...", id="inp-adv-url")
-                yield Label("API key env var", id="lbl-adv-key")
-                yield Input(placeholder="DEEPSEEK_API_KEY", id="inp-adv-key")
-                yield Label("Wire format", id="lbl-adv-wire")
-                yield Select(
-                    [("openai", "openai"), ("anthropic", "anthropic"), ("devin", "devin")],
-                    value="openai",
-                    id="sel-adv-wire",
-                )
-
-                yield Label("Embedding provider", id="lbl-emb-provider")
-                yield Input(
-                    value=current_emb_provider,
-                    placeholder="openai",
-                    id="inp-emb-provider",
-                )
-                yield Label("Embedding model", id="lbl-emb-model")
-                yield Input(
-                    value=current_emb_model,
-                    placeholder="text-embedding-3-small",
-                    id="inp-emb-model",
-                )
-
-                yield Button("Save", variant="primary", id="btn-save")
-                yield Button("Cancel", id="btn-cancel")
-
-        def on_button_pressed(self, event: Button.Pressed) -> None:
-            if event.button.id == "btn-cancel":
-                self.dismiss(None)
-                return
-            if event.button.id == "btn-save":
-                result = self._collect()
-                self.dismiss(result)
-
-        def _collect(self) -> dict:
-            data: dict = {}
-            data["provider"] = self.query_one("#sel-provider", Select).value
-            data["model"] = self.query_one("#inp-model", Input).value.strip()
-            data["effort"] = self.query_one("#sel-effort", Select).value
-            data["embedding_provider"] = self.query_one(
-                "#inp-emb-provider", Input
-            ).value.strip()
-            data["embedding_model"] = self.query_one(
-                "#inp-emb-model", Input
-            ).value.strip()
-
-            adv_name = self.query_one("#inp-adv-name", Input).value.strip()
-            adv_url = self.query_one("#inp-adv-url", Input).value.strip()
-            adv_key = self.query_one("#inp-adv-key", Input).value.strip()
-            adv_wire = self.query_one("#sel-adv-wire", Select).value
-            if adv_name and adv_url and adv_key:
-                data["new_provider"] = {
-                    "name": adv_name,
-                    "base_url": adv_url,
-                    "api_key_env": adv_key,
-                    "wire_format": adv_wire,
-                    "model": data.get("model", ""),
-                }
-            return data
-
-        def on_select_changed(self, event: Select.Changed) -> None:
-            if event.select.id == "sel-provider":
-                profile = self._cfg.providers.get(str(event.value))
-                if profile:
-                    self.query_one("#inp-model", Input).value = profile.model
-
-        def action_dismiss_settings(self) -> None:
-            self.dismiss(None)
+    _ENGINE_ADD_STEPS = [
+        ("name", "name: "),
+        ("base_url", "base url: "),
+        ("api_key_env", "api key env var: "),
+        ("wire_format", "wire format (openai/anthropic/devin) [openai]: "),
+    ]
 
     # ---- Main TUI app --------------------------------------------------
 
@@ -353,6 +205,7 @@ def make_app(
             self._current_md: Markdown | None = None
             self._turn_active = False
             self._has_turns = False
+            self._engine_add_state: dict | None = None
 
         # ---- layout -----------------------------------------------------
 
@@ -408,6 +261,10 @@ def make_app(
         def on_input_submitted(self, event: Input.Submitted) -> None:
             value = event.value.strip()
             event.input.value = ""
+            # Engine-add wizard intercepts all input while active.
+            if self._engine_add_state is not None:
+                self._engine_add_step(value)
+                return
             if not value:
                 return
             if value.startswith("/"):
@@ -437,6 +294,8 @@ def make_app(
                 self._cmd_model(arg)
             elif cmd == "/settings":
                 self._cmd_settings()
+            elif cmd == "/engine":
+                self._cmd_engine(arg)
             elif cmd == "/memory":
                 self._cmd_memory()
             else:
@@ -463,14 +322,20 @@ def make_app(
                 self._write(f"Invalid effort {arg!r}. Use: low, medium, high.", "warn")
                 return
             new_effort = _EFFORT_NAMES[level]
-            self.orchestrator.effort = new_effort
             caps = self.provider.capabilities()
             if caps.effort_levels and new_effort not in caps.effort_levels:
+                supported = ", ".join(e.value for e in caps.effort_levels)
                 self._write(
-                    f"note: {self.provider.name} may ignore "
-                    f"effort={new_effort.value}.",
+                    f"{self.provider.name} does not support effort "
+                    f"{new_effort.value}. Supported: {supported}.",
                     "warn",
                 )
+                return
+            self.orchestrator.effort = new_effort
+            self.effort = new_effort
+            settings = load_settings()
+            settings["effort"] = new_effort.value
+            save_settings(settings)
             self._write(f"effort · {new_effort.value}", "meta")
 
         def _cmd_model(self, arg: str) -> None:
@@ -485,6 +350,9 @@ def make_app(
                 return
             self.provider = new_provider
             self.orchestrator.provider = new_provider
+            settings = load_settings()
+            settings["model"] = arg
+            save_settings(settings)
             self._write(f"model · {arg}", "meta")
 
         def _cmd_memory(self) -> None:
@@ -502,65 +370,170 @@ def make_app(
                 self._write(f"  {snippet}", "meta")
 
         def _cmd_settings(self) -> None:
-            self.push_screen(SettingsScreen(self.cfg), callback=self._on_settings_dismiss)
-
-        def _on_settings_dismiss(self, result) -> None:
-            if result is None:
-                return
+            """Read-only display of current settings + usage hints."""
+            model = getattr(self.provider, "_model", "") or self.provider.name
             settings = load_settings()
+            emb_prov = settings.get(
+                "embedding_provider",
+                self.cfg.embedding_provider or "openai",
+            )
+            emb_model = settings.get(
+                "embedding_model", self.cfg.openai_embedding_model,
+            )
+            lines = [
+                "Settings",
+                "\u2500" * 44,
+                f"  engine           {self.provider.name}",
+                f"  model            {model}",
+                f"  effort           {self.orchestrator.effort.value}",
+                f"  embedding        {emb_prov} / {emb_model}",
+                "",
+                "  Use:",
+                "    /engine <name>            switch engine",
+                "    /engine                   list available engines",
+                "    /model <name>             switch chat model",
+                "    /effort <low|medium|high> set reasoning effort",
+                "    /engine add               register a custom engine",
+                "\u2500" * 44,
+            ]
+            for line in lines:
+                self._write(line, "meta")
 
-            # Handle new custom provider
-            new_prov = result.pop("new_provider", None)
-            if new_prov:
-                name = new_prov.pop("name")
-                settings.setdefault("providers", {})[name] = new_prov
-                self.cfg.providers[name] = ProviderProfile(
-                    base_url=new_prov["base_url"],
-                    model=new_prov.get("model", ""),
-                    api_key_env=new_prov["api_key_env"],
-                    wire_format=new_prov.get("wire_format", "openai"),
+        def _cmd_engine(self, arg: str) -> None:
+            """Show, switch, or register engines."""
+            if not arg:
+                self._cmd_engine_list()
+            elif arg.lower() == "add":
+                self._cmd_engine_add_start()
+            else:
+                self._cmd_engine_switch(arg)
+
+        def _cmd_engine_list(self) -> None:
+            """List available engines with the active one marked."""
+            model = getattr(self.provider, "_model", "") or self.provider.name
+            self._write(
+                f"current \u00b7 {self.provider.name} ({model})", "meta",
+            )
+            self._write("", "meta")
+            self._write("  available engines:", "meta")
+            for name in sorted(self.cfg.providers):
+                profile = self.cfg.providers[name]
+                marker = "\u2666" if name == self.provider.name else " "
+                self._write(
+                    f"    {name:<16} {marker} {profile.api_key_env}", "meta",
+                )
+            self._write("", "meta")
+            self._write(
+                "  /engine <name> to switch \u00b7 /engine add to register",
+                "meta",
+            )
+
+        def _cmd_engine_switch(self, name: str) -> None:
+            """Switch the active engine to *name*."""
+            profile = self.cfg.providers.get(name)
+            if profile is None:
+                available = ", ".join(sorted(self.cfg.providers))
+                self._write(
+                    f"Unknown engine {name!r}. Available: {available}", "warn",
+                )
+                return
+            try:
+                new_provider = build_provider_from_profile(
+                    name, profile,
+                    embedding_model=self.cfg.openai_embedding_model,
+                )
+            except Exception as exc:
+                self._write(f"Cannot switch engine: {exc}", "warn")
+                return
+            self.provider = new_provider
+            self.orchestrator.provider = new_provider
+
+            # Effort mismatch: reset to medium if unsupported.
+            caps = new_provider.capabilities()
+            old_effort = self.orchestrator.effort
+            if caps.effort_levels and old_effort not in caps.effort_levels:
+                default_effort = Effort.MEDIUM
+                self.orchestrator.effort = default_effort
+                self.effort = default_effort
+                self._write(
+                    f"note: {name} does not support effort "
+                    f"{old_effort.value}. Reset to medium.",
+                    "warn",
                 )
 
-            chosen_provider = result.get("provider", self.cfg.provider)
-            chosen_model = result.get("model", "")
-            chosen_effort = result.get("effort", self.orchestrator.effort.value)
-            emb_provider = result.get("embedding_provider", "")
-            emb_model = result.get("embedding_model", "")
-
-            settings["provider"] = chosen_provider
-            settings["effort"] = chosen_effort
-            settings["embedding_provider"] = emb_provider
-            settings["embedding_model"] = emb_model
+            settings = load_settings()
+            settings["provider"] = name
+            settings["effort"] = self.orchestrator.effort.value
             save_settings(settings)
 
-            # Rebuild provider
-            try:
-                profile = self.cfg.providers.get(chosen_provider)
-                if profile and chosen_model:
-                    overridden = ProviderProfile(
-                        base_url=profile.base_url,
-                        model=chosen_model,
-                        api_key_env=profile.api_key_env,
-                        wire_format=profile.wire_format,
-                    )
-                    new_provider = build_provider_from_profile(
-                        chosen_provider, overridden,
-                        embedding_model=emb_model or self.cfg.openai_embedding_model,
-                    )
-                else:
-                    new_provider = _build_provider(chosen_provider, self.cfg)
-                self.provider = new_provider
-                self.orchestrator.provider = new_provider
-            except Exception as exc:
-                self._write(f"Could not switch provider: {exc}", "warn")
+            model = getattr(new_provider, "_model", "") or name
+            self._write(
+                f"{name} \u00b7 {model} \u00b7 effort "
+                f"{self.orchestrator.effort.value}",
+                "meta",
+            )
 
-            # Update effort
-            if chosen_effort in _EFFORT_NAMES:
-                self.orchestrator.effort = _EFFORT_NAMES[chosen_effort]
-                self.effort = _EFFORT_NAMES[chosen_effort]
+        def _cmd_engine_add_start(self) -> None:
+            """Begin the interactive engine-registration wizard."""
+            self._engine_add_state = {"step": 0, "data": {}}
+            self._write(_ENGINE_ADD_STEPS[0][1], "meta")
+            self._set_hint("type a value and press Enter (Esc to cancel)")
 
-            self._cmd_status()
-            self._write("settings saved.", "meta")
+        def _engine_add_step(self, value: str) -> None:
+            """Process one step of the engine-add wizard."""
+            state = self._engine_add_state
+            if state is None:
+                return
+            step_idx = state["step"]
+            key, _prompt = _ENGINE_ADD_STEPS[step_idx]
+
+            # Apply default for wire_format.
+            if key == "wire_format" and not value:
+                value = "openai"
+
+            # Validate required fields.
+            if not value and key != "wire_format":
+                self._write(f"{key} is required.", "warn")
+                self._write(_ENGINE_ADD_STEPS[step_idx][1], "meta")
+                return
+
+            state["data"][key] = value
+            step_idx += 1
+            state["step"] = step_idx
+
+            if step_idx < len(_ENGINE_ADD_STEPS):
+                self._write(_ENGINE_ADD_STEPS[step_idx][1], "meta")
+            else:
+                self._engine_add_finish(state["data"])
+
+        def _engine_add_finish(self, data: dict) -> None:
+            """Register the new engine and persist it."""
+            self._engine_add_state = None
+            self._set_hint(_DEFAULT_HINT)
+
+            name = data["name"]
+            profile = ProviderProfile(
+                base_url=data["base_url"],
+                model="",
+                api_key_env=data["api_key_env"],
+                wire_format=data.get("wire_format", "openai"),
+            )
+            self.cfg.providers[name] = profile
+
+            settings = load_settings()
+            settings.setdefault("providers", {})[name] = {
+                "base_url": profile.base_url,
+                "api_key_env": profile.api_key_env,
+                "wire_format": profile.wire_format,
+                "model": profile.model,
+            }
+            save_settings(settings)
+
+            self._write(
+                f"engine registered \u00b7 {name} "
+                f"({profile.wire_format} wire format)",
+                "meta",
+            )
 
         # ---- turn execution --------------------------------------------
 
@@ -628,6 +601,11 @@ def make_app(
         # ---- actions ----------------------------------------------------
 
         def action_interrupt(self) -> None:
+            if self._engine_add_state is not None:
+                self._engine_add_state = None
+                self._write("(cancelled)", "warn")
+                self._set_hint(_DEFAULT_HINT)
+                return
             if not self._turn_active:
                 return
             self.workers.cancel_group(self, "turn")
