@@ -40,10 +40,11 @@ _DEFAULT_DB_PATH = "rickshaw_memory.db"
 # Slash-commands, used for help text and inline autocomplete.
 _COMMANDS = {
     "/help": "Show this help.",
-    "/status": "Show engine, model, and effort.",
-    "/settings": "Show current settings and usage hints.",
+    "/status": "Show provider, model, and effort.",
+    "/settings": "Interactive provider/model picker (also shows current settings).",
+    "/models": "List the current provider's available models.",
     "/clear": "Clear the transcript.",
-    "/engine": "/engine [name|add] -- show, switch, or register an engine.",
+    "/provider": "/provider [name|add] -- show, switch, or register a provider.",
     "/effort": "/effort <low|medium|high> -- set reasoning effort.",
     "/model": "/model [name] -- show or switch the chat model.",
     "/memory": "List recently stored memories.",
@@ -136,9 +137,9 @@ def make_app(
 
     cfg = cfg or RickshawConfig()
 
-    # ---- Engine-add wizard steps ----------------------------------------
+    # ---- Provider-add wizard steps ------------------------------------
 
-    _ENGINE_ADD_STEPS = [
+    _PROVIDER_ADD_STEPS = [
         ("name", "name: "),
         ("base_url", "base url: "),
         ("api_key_env", "api key env var: "),
@@ -205,7 +206,8 @@ def make_app(
             self._current_md: Markdown | None = None
             self._turn_active = False
             self._has_turns = False
-            self._engine_add_state: dict | None = None
+            self._provider_add_state: dict | None = None
+            self._settings_state: dict | None = None
 
         # ---- layout -----------------------------------------------------
 
@@ -261,9 +263,12 @@ def make_app(
         def on_input_submitted(self, event: Input.Submitted) -> None:
             value = event.value.strip()
             event.input.value = ""
-            # Engine-add wizard intercepts all input while active.
-            if self._engine_add_state is not None:
-                self._engine_add_step(value)
+            # Wizard intercepts all input while active.
+            if self._settings_state is not None:
+                self._settings_step(value)
+                return
+            if self._provider_add_state is not None:
+                self._provider_add_step(value)
                 return
             if not value:
                 return
@@ -294,8 +299,10 @@ def make_app(
                 self._cmd_model(arg)
             elif cmd == "/settings":
                 self._cmd_settings()
-            elif cmd == "/engine":
-                self._cmd_engine(arg)
+            elif cmd == "/models":
+                self._cmd_models()
+            elif cmd in ("/provider", "/engine"):
+                self._cmd_provider(arg)
             elif cmd == "/memory":
                 self._cmd_memory()
             else:
@@ -311,7 +318,7 @@ def make_app(
             caps = self.provider.capabilities()
             tools = "tools on" if caps.function_calling else "tools off"
             self._write(
-                f"{self.provider.name} · {model} · effort "
+                f"provider · {self.provider.name} · {model} · effort "
                 f"{self.orchestrator.effort.value} · {tools}",
                 "meta",
             )
@@ -340,9 +347,39 @@ def make_app(
 
         def _cmd_model(self, arg: str) -> None:
             if not arg:
+                # List the current provider's available models.
                 model = getattr(self.provider, "_model", "") or "(unknown)"
-                self._write(f"Current model: {model}", "meta")
+                self._write(
+                    f"current · {self.provider.name} ({model})", "meta",
+                )
+                self._write("", "meta")
+                try:
+                    models = self.provider.available_models()
+                except Exception as exc:
+                    self._write(f"Cannot list models: {exc}", "warn")
+                    return
+                self._write("  available models:", "meta")
+                for m in models:
+                    marker = "♦" if m == model else " "
+                    self._write(f"    {m:<32} {marker}", "meta")
                 return
+
+            # Strict validation: only allow models from the current provider.
+            try:
+                valid_models = self.provider.available_models()
+            except Exception as exc:
+                self._write(f"Cannot validate model: {exc}", "warn")
+                return
+
+            if arg not in valid_models:
+                display = ", ".join(valid_models)
+                self._write(
+                    f"Unknown model {arg!r} for {self.provider.name}. "
+                    f"Available: {display}",
+                    "warn",
+                )
+                return
+
             try:
                 new_provider = _rebuild_provider(self.provider.name, self.cfg, arg)
             except Exception as exc:
@@ -350,8 +387,23 @@ def make_app(
                 return
             self.provider = new_provider
             self.orchestrator.provider = new_provider
+
+            # Effort reconciliation: reset to medium if unsupported.
+            caps = new_provider.capabilities()
+            old_effort = self.orchestrator.effort
+            if caps.effort_levels and old_effort not in caps.effort_levels:
+                default_effort = Effort.MEDIUM
+                self.orchestrator.effort = default_effort
+                self.effort = default_effort
+                self._write(
+                    f"note: {arg} does not support effort "
+                    f"{old_effort.value}. Reset to medium.",
+                    "warn",
+                )
+
             settings = load_settings()
             settings["model"] = arg
+            settings["effort"] = self.orchestrator.effort.value
             save_settings(settings)
             self._write(f"model · {arg}", "meta")
 
@@ -369,8 +421,25 @@ def make_app(
                 snippet = rec.text if len(rec.text) <= 100 else rec.text[:97] + "…"
                 self._write(f"  {snippet}", "meta")
 
+        def _cmd_models(self) -> None:
+            """Non-interactive list of the current provider's models."""
+            model = getattr(self.provider, "_model", "") or "(unknown)"
+            self._write(
+                f"current \u00b7 {self.provider.name} ({model})", "meta",
+            )
+            self._write("", "meta")
+            try:
+                models = self.provider.available_models()
+            except Exception as exc:
+                self._write(f"Cannot list models: {exc}", "warn")
+                return
+            self._write("  available models:", "meta")
+            for m in models:
+                marker = "\u2666" if m == model else " "
+                self._write(f"    {m:<32} {marker}", "meta")
+
         def _cmd_settings(self) -> None:
-            """Read-only display of current settings + usage hints."""
+            """Interactive provider/model picker with settings header."""
             model = getattr(self.provider, "_model", "") or self.provider.name
             settings = load_settings()
             emb_prov = settings.get(
@@ -383,39 +452,163 @@ def make_app(
             lines = [
                 "Settings",
                 "\u2500" * 44,
-                f"  engine           {self.provider.name}",
+                f"  provider         {self.provider.name}",
                 f"  model            {model}",
                 f"  effort           {self.orchestrator.effort.value}",
                 f"  embedding        {emb_prov} / {emb_model}",
-                "",
-                "  Use:",
-                "    /engine <name>            switch engine",
-                "    /engine                   list available engines",
-                "    /model <name>             switch chat model",
-                "    /effort <low|medium|high> set reasoning effort",
-                "    /engine add               register a custom engine",
                 "\u2500" * 44,
             ]
             for line in lines:
                 self._write(line, "meta")
 
-        def _cmd_engine(self, arg: str) -> None:
-            """Show, switch, or register engines."""
-            if not arg:
-                self._cmd_engine_list()
-            elif arg.lower() == "add":
-                self._cmd_engine_add_start()
-            else:
-                self._cmd_engine_switch(arg)
+            # Step 1: list providers and prompt the user to pick one.
+            provider_names = sorted(self.cfg.providers)
+            if not provider_names:
+                self._write("No providers configured.", "warn")
+                return
+            self._write("", "meta")
+            self._write("  Pick a provider (enter name, Esc to cancel):", "meta")
+            for name in provider_names:
+                marker = "\u2666" if name == self.provider.name else " "
+                self._write(f"    {name:<16} {marker}", "meta")
+            self._settings_state = {"step": "provider", "providers": provider_names}
+            self._set_hint("provider name (Enter to submit, Esc to cancel)")
 
-        def _cmd_engine_list(self) -> None:
-            """List available engines with the active one marked."""
+        def _settings_step(self, value: str) -> None:
+            """Process one step of the interactive /settings wizard."""
+            state = self._settings_state
+            if state is None:
+                return
+
+            if state["step"] == "provider":
+                if not value:
+                    self._write("(cancelled)", "warn")
+                    self._settings_state = None
+                    self._set_hint(_DEFAULT_HINT)
+                    return
+                chosen = value.strip()
+                if chosen not in self.cfg.providers:
+                    available = ", ".join(state["providers"])
+                    self._write(
+                        f"Unknown provider {chosen!r}. Available: {available}",
+                        "warn",
+                    )
+                    return
+                self._write(f"  provider: {chosen}", "meta")
+
+                # Build a temporary provider to list its models.
+                profile = self.cfg.providers[chosen]
+                try:
+                    temp = build_provider_from_profile(
+                        chosen, profile,
+                        embedding_model=self.cfg.openai_embedding_model,
+                    )
+                    models = temp.available_models()
+                except Exception as exc:
+                    self._write(f"Cannot list models for {chosen}: {exc}", "warn")
+                    self._settings_state = None
+                    self._set_hint(_DEFAULT_HINT)
+                    return
+
+                if not models:
+                    self._write(f"No models available for {chosen}.", "warn")
+                    self._settings_state = None
+                    self._set_hint(_DEFAULT_HINT)
+                    return
+
+                current_model = (
+                    getattr(self.provider, "_model", "")
+                    if chosen == self.provider.name
+                    else ""
+                )
+                self._write("", "meta")
+                self._write("  Pick a model (enter name, Esc to cancel):", "meta")
+                for m in models:
+                    marker = "\u2666" if m == current_model else " "
+                    self._write(f"    {m:<32} {marker}", "meta")
+                state["step"] = "model"
+                state["chosen_provider"] = chosen
+                state["valid_models"] = models
+                self._set_hint("model name (Enter to submit, Esc to cancel)")
+
+            elif state["step"] == "model":
+                if not value:
+                    self._write("(cancelled)", "warn")
+                    self._settings_state = None
+                    self._set_hint(_DEFAULT_HINT)
+                    return
+                model_name = value.strip()
+                valid_models = state["valid_models"]
+                chosen_provider = state["chosen_provider"]
+                if model_name not in valid_models:
+                    display = ", ".join(valid_models)
+                    self._write(
+                        f"Unknown model {model_name!r}. Available: {display}",
+                        "warn",
+                    )
+                    return
+                self._write(f"  model: {model_name}", "meta")
+
+                # Apply the provider + model switch.
+                self._settings_apply(chosen_provider, model_name)
+                self._settings_state = None
+                self._set_hint(_DEFAULT_HINT)
+
+        def _settings_apply(self, provider_name: str, model_name: str) -> None:
+            """Apply provider + model selection from /settings wizard."""
+            profile = self.cfg.providers[provider_name]
+            try:
+                new_provider = _rebuild_provider(
+                    provider_name, self.cfg, model_name,
+                )
+            except Exception as exc:
+                self._write(f"Cannot switch: {exc}", "warn")
+                return
+            self.provider = new_provider
+            self.orchestrator.provider = new_provider
+
+            # Effort reconciliation.
+            caps = new_provider.capabilities()
+            old_effort = self.orchestrator.effort
+            if caps.effort_levels and old_effort not in caps.effort_levels:
+                default_effort = Effort.MEDIUM
+                self.orchestrator.effort = default_effort
+                self.effort = default_effort
+                self._write(
+                    f"note: {provider_name} does not support effort "
+                    f"{old_effort.value}. Reset to medium.",
+                    "warn",
+                )
+
+            settings = load_settings()
+            settings["provider"] = provider_name
+            settings["model"] = model_name
+            settings["effort"] = self.orchestrator.effort.value
+            save_settings(settings)
+
+            self._write(
+                f"{provider_name} \u00b7 {model_name} \u00b7 effort "
+                f"{self.orchestrator.effort.value}",
+                "meta",
+            )
+
+        def _cmd_provider(self, arg: str) -> None:
+            """Show, switch, or register providers."""
+            if not arg:
+                self._cmd_provider_list()
+            elif arg.lower() == "add":
+                self._cmd_provider_add_start()
+            else:
+                self._cmd_provider_switch(arg)
+
+        def _cmd_provider_list(self) -> None:
+            """List available providers with the active one marked."""
             model = getattr(self.provider, "_model", "") or self.provider.name
             self._write(
                 f"current \u00b7 {self.provider.name} ({model})", "meta",
             )
             self._write("", "meta")
-            self._write("  available engines:", "meta")
+            self._write("  available providers:", "meta")
             for name in sorted(self.cfg.providers):
                 profile = self.cfg.providers[name]
                 marker = "\u2666" if name == self.provider.name else " "
@@ -424,17 +617,17 @@ def make_app(
                 )
             self._write("", "meta")
             self._write(
-                "  /engine <name> to switch \u00b7 /engine add to register",
+                "  /provider <name> to switch \u00b7 /provider add to register",
                 "meta",
             )
 
-        def _cmd_engine_switch(self, name: str) -> None:
-            """Switch the active engine to *name*."""
+        def _cmd_provider_switch(self, name: str) -> None:
+            """Switch the active provider to *name*."""
             profile = self.cfg.providers.get(name)
             if profile is None:
                 available = ", ".join(sorted(self.cfg.providers))
                 self._write(
-                    f"Unknown engine {name!r}. Available: {available}", "warn",
+                    f"Unknown provider {name!r}. Available: {available}", "warn",
                 )
                 return
             try:
@@ -443,7 +636,7 @@ def make_app(
                     embedding_model=self.cfg.openai_embedding_model,
                 )
             except Exception as exc:
-                self._write(f"Cannot switch engine: {exc}", "warn")
+                self._write(f"Cannot switch provider: {exc}", "warn")
                 return
             self.provider = new_provider
             self.orchestrator.provider = new_provider
@@ -473,19 +666,19 @@ def make_app(
                 "meta",
             )
 
-        def _cmd_engine_add_start(self) -> None:
-            """Begin the interactive engine-registration wizard."""
-            self._engine_add_state = {"step": 0, "data": {}}
-            _key, prompt = _ENGINE_ADD_STEPS[0]
+        def _cmd_provider_add_start(self) -> None:
+            """Begin the interactive provider-registration wizard."""
+            self._provider_add_state = {"step": 0, "data": {}}
+            _key, prompt = _PROVIDER_ADD_STEPS[0]
             self._set_hint(f"{prompt}(Enter to submit, Esc to cancel)")
 
-        def _engine_add_step(self, value: str) -> None:
-            """Process one step of the engine-add wizard."""
-            state = self._engine_add_state
+        def _provider_add_step(self, value: str) -> None:
+            """Process one step of the provider-add wizard."""
+            state = self._provider_add_state
             if state is None:
                 return
             step_idx = state["step"]
-            key, prompt_text = _ENGINE_ADD_STEPS[step_idx]
+            key, prompt_text = _PROVIDER_ADD_STEPS[step_idx]
 
             # Apply default for wire_format.
             if key == "wire_format" and not value:
@@ -494,7 +687,7 @@ def make_app(
             # Validate required fields.
             if not value and key != "wire_format":
                 self._write(f"{key} is required.", "warn")
-                self._write(_ENGINE_ADD_STEPS[step_idx][1], "meta")
+                self._write(_PROVIDER_ADD_STEPS[step_idx][1], "meta")
                 return
 
             # Echo the user's input next to the prompt so the transcript
@@ -505,15 +698,15 @@ def make_app(
             step_idx += 1
             state["step"] = step_idx
 
-            if step_idx < len(_ENGINE_ADD_STEPS):
-                _next_key, next_prompt = _ENGINE_ADD_STEPS[step_idx]
+            if step_idx < len(_PROVIDER_ADD_STEPS):
+                _next_key, next_prompt = _PROVIDER_ADD_STEPS[step_idx]
                 self._set_hint(f"{next_prompt}(Enter to submit, Esc to cancel)")
             else:
-                self._engine_add_finish(state["data"])
+                self._provider_add_finish(state["data"])
 
-        def _engine_add_finish(self, data: dict) -> None:
-            """Register the new engine and persist it."""
-            self._engine_add_state = None
+        def _provider_add_finish(self, data: dict) -> None:
+            """Register the new provider and persist it."""
+            self._provider_add_state = None
             self._set_hint(_DEFAULT_HINT)
 
             name = data["name"]
@@ -535,7 +728,7 @@ def make_app(
             save_settings(settings)
 
             self._write(
-                f"engine registered \u00b7 {name} "
+                f"provider registered \u00b7 {name} "
                 f"({profile.wire_format} wire format)",
                 "meta",
             )
@@ -606,8 +799,13 @@ def make_app(
         # ---- actions ----------------------------------------------------
 
         def action_interrupt(self) -> None:
-            if self._engine_add_state is not None:
-                self._engine_add_state = None
+            if self._settings_state is not None:
+                self._settings_state = None
+                self._write("(cancelled)", "warn")
+                self._set_hint(_DEFAULT_HINT)
+                return
+            if self._provider_add_state is not None:
+                self._provider_add_state = None
                 self._write("(cancelled)", "warn")
                 self._set_hint(_DEFAULT_HINT)
                 return
