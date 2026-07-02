@@ -1,11 +1,14 @@
 """Tests for provider implementations (mocked HTTP)."""
 
 import json
+from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
 import respx
 
+from rickshaw.config import ProviderProfile, is_local_url
 from rickshaw.providers.base import Effort, Message, Response, ToolCall, ToolSpec
 from rickshaw.providers.openai_provider import OpenAIProvider
 from rickshaw.providers.devin_provider import DevinProvider
@@ -702,3 +705,191 @@ def test_anthropic_available_models():
 def test_anthropic_name():
     provider = AnthropicProvider(api_key="sk-ant-test")
     assert provider.name == "anthropic"
+
+
+# ---------------------------------------------------------------------------
+# is_local_url / ProviderProfile.is_local_endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:8000/v1",
+        "http://[::1]:8000/v1",
+        "http://0.0.0.0:8080/v1",
+        "http://mybox.local:5000/api",
+        "http://10.0.0.5:8080/v1",
+        "http://192.168.1.100:8000/v1",
+        "http://172.16.0.1:9000/v1",
+    ],
+)
+def test_is_local_url_true(url: str):
+    assert is_local_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.openai.com/v1",
+        "https://api.anthropic.com",
+        "https://api.devin.ai",
+        "https://api.deepseek.com/v1",
+    ],
+)
+def test_is_local_url_false(url: str):
+    assert is_local_url(url) is False
+
+
+def test_provider_profile_is_local_endpoint():
+    local = ProviderProfile(
+        base_url="http://localhost:11434/v1", model="llama3", api_key_env="X",
+    )
+    assert local.is_local_endpoint() is True
+
+    remote = ProviderProfile(
+        base_url="https://api.openai.com/v1", model="gpt-4o", api_key_env="Y",
+    )
+    assert remote.is_local_endpoint() is False
+
+
+# ---------------------------------------------------------------------------
+# Model cache: in-memory single-fetch
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_openai_available_models_single_fetch(tmp_path: Path):
+    """The httpx network call happens exactly once across multiple calls."""
+    route = respx.get("https://api.openai.com/v1/models").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": "gpt-4o"}, {"id": "gpt-3.5-turbo"}]}
+        )
+    )
+
+    cache_path = tmp_path / "models_cache.json"
+    with patch("rickshaw.settings.load_model_cache", return_value={}), \
+         patch("rickshaw.settings.save_model_cache") as mock_save:
+        provider = OpenAIProvider(api_key="sk-test")
+        m1 = provider.available_models()
+        m2 = provider.available_models()
+        m3 = provider.available_models()
+
+    assert route.call_count == 1
+    assert m1 == m2 == m3
+    assert "gpt-4o" in m1
+    mock_save.assert_called_once()
+
+
+@respx.mock
+def test_anthropic_available_models_single_fetch():
+    """Static-list providers also cache in-memory (one fetcher call)."""
+    with patch("rickshaw.settings.load_model_cache", return_value={}), \
+         patch("rickshaw.settings.save_model_cache"):
+        provider = AnthropicProvider(api_key="sk-ant-test")
+        m1 = provider.available_models()
+        m2 = provider.available_models()
+
+    assert m1 == m2
+    assert "claude-3-5-sonnet-latest" in m1
+
+
+@respx.mock
+def test_devin_available_models_single_fetch():
+    """DevinProvider caches its static list in-memory."""
+    with patch("rickshaw.settings.load_model_cache", return_value={}), \
+         patch("rickshaw.settings.save_model_cache"):
+        provider = DevinProvider(api_key="test-key")
+        m1 = provider.available_models()
+        m2 = provider.available_models()
+
+    assert m1 == m2
+    assert "devin" in m1
+
+
+# ---------------------------------------------------------------------------
+# Model cache: disk fallback on network failure
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_openai_disk_fallback_on_network_failure():
+    """When the network fetch fails, fall back to the disk-cached list."""
+    respx.get("https://api.openai.com/v1/models").mock(
+        return_value=httpx.Response(500, json={"error": "down"})
+    )
+
+    cached_disk = {"openai:https://api.openai.com/v1": ["gpt-4o-cached"]}
+    with patch("rickshaw.settings.load_model_cache", return_value=cached_disk), \
+         patch("rickshaw.settings.save_model_cache"):
+        provider = OpenAIProvider(api_key="sk-test")
+        models = provider.available_models()
+
+    assert models == ["gpt-4o-cached"]
+
+
+# ---------------------------------------------------------------------------
+# Model cache: no cache + remote API → instructive error
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_openai_no_cache_remote_raises():
+    """No disk cache + remote endpoint failure → ConnectionError with guidance."""
+    respx.get("https://api.openai.com/v1/models").mock(
+        return_value=httpx.Response(500, json={"error": "down"})
+    )
+
+    with patch("rickshaw.settings.load_model_cache", return_value={}):
+        provider = OpenAIProvider(api_key="sk-test")
+        with pytest.raises(ConnectionError, match="connect to the internet"):
+            provider.available_models()
+
+
+# ---------------------------------------------------------------------------
+# Model cache: local host → surfaces raw connection error
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_openai_local_host_surfaces_raw_error():
+    """Local endpoint failure → ConnectionError naming the local server."""
+    respx.get("http://localhost:11434/v1/models").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+
+    with patch("rickshaw.settings.load_model_cache", return_value={}):
+        provider = OpenAIProvider(
+            api_key="sk-test", base_url="http://localhost:11434/v1"
+        )
+        with pytest.raises(ConnectionError, match="local inference server"):
+            provider.available_models()
+
+
+# ---------------------------------------------------------------------------
+# Model cache: disk cache is written on successful fetch
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_openai_disk_cache_written_on_success():
+    """A successful fetch persists the result to the disk cache."""
+    respx.get("https://api.openai.com/v1/models").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": "gpt-4o"}]}
+        )
+    )
+
+    saved: list[dict] = []
+
+    def _capture_save(data: dict, path=None):
+        saved.append(data)
+
+    with patch("rickshaw.settings.load_model_cache", return_value={}), \
+         patch("rickshaw.settings.save_model_cache", side_effect=_capture_save):
+        provider = OpenAIProvider(api_key="sk-test")
+        provider.available_models()
+
+    assert len(saved) == 1
+    assert saved[0]["openai:https://api.openai.com/v1"] == ["gpt-4o"]

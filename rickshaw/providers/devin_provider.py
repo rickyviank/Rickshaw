@@ -12,6 +12,7 @@ from typing import Any, Iterator
 
 import httpx
 
+from rickshaw.config import is_local_url
 from rickshaw.providers.base import (
     Capabilities,
     Effort,
@@ -111,9 +112,16 @@ class DevinProvider(LLMProvider):
     # stream() is inherited from LLMProvider — falls back to complete().
     # TODO: Override with native streaming once the Devin API supports it.
 
-    def available_models(self) -> list[str]:
-        # TODO: Query the Devin API for available models/agents.
+    @staticmethod
+    def _static_models() -> list[str]:
         return ["devin"]
+
+    def available_models(self) -> list[str]:
+        return self._cached_available_models(
+            self._static_models,
+            cache_key=f"devin:{self._base_url}",
+            is_local=is_local_url(self._base_url),
+        )
 
     def validate(self) -> None:
         if not self._api_key:
