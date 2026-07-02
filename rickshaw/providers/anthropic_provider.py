@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from rickshaw.config import is_local_url
 from rickshaw.providers.base import (
     Capabilities,
     Effort,
@@ -214,9 +215,8 @@ class AnthropicProvider(LLMProvider):
     # stream() is inherited from LLMProvider — falls back to complete().
     # TODO: Override with native SSE streaming of Anthropic message deltas.
 
-    def available_models(self) -> list[str]:
-        # Anthropic exposes no public list-models endpoint, so return a static
-        # list of well-known Claude model identifiers.
+    @staticmethod
+    def _static_models() -> list[str]:
         return [
             "claude-3-5-sonnet-latest",
             "claude-3-5-haiku-latest",
@@ -224,6 +224,13 @@ class AnthropicProvider(LLMProvider):
             "claude-3-sonnet-20240229",
             "claude-3-haiku-20240307",
         ]
+
+    def available_models(self) -> list[str]:
+        return self._cached_available_models(
+            self._static_models,
+            cache_key=f"anthropic:{self._base_url}",
+            is_local=is_local_url(self._base_url),
+        )
 
     def validate(self) -> None:
         if not self._api_key:

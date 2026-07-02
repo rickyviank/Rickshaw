@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import enum
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
+
+_log = logging.getLogger(__name__)
 
 
 class Effort(enum.Enum):
@@ -153,6 +156,75 @@ class LLMProvider(ABC):
     @abstractmethod
     def available_models(self) -> list[str]:
         """Return a list of model identifiers this provider can serve."""
+
+    # ------------------------------------------------------------------
+    # Caching helper for available_models
+    # ------------------------------------------------------------------
+
+    _models_cache: list[str] | None = None
+
+    def _cached_available_models(
+        self,
+        fetcher: Callable[[], list[str]],
+        *,
+        cache_key: str,
+        is_local: bool,
+    ) -> list[str]:
+        """Shared caching logic for :meth:`available_models`.
+
+        *fetcher* performs the actual (possibly network) retrieval.
+        *cache_key* is ``"provider_name:base_url"`` for disk persistence.
+        *is_local* controls error messaging on failure.
+
+        Contract:
+        - At most one *fetcher* call per provider instance lifetime.
+        - On success the result is stored both in-memory and on disk.
+        - On failure, fall back to the disk cache.
+        - If there is no disk cache and the endpoint is remote, raise an
+          instructive error asking the user to connect to the internet.
+        - If the endpoint is local, re-raise the original error so the user
+          knows their inference server isn't reachable.
+        """
+        if self._models_cache is not None:
+            return list(self._models_cache)
+
+        from rickshaw.settings import load_model_cache, save_model_cache
+
+        try:
+            models = fetcher()
+        except Exception as fetch_err:
+            # Network / connection failure — try the disk cache.
+            disk = load_model_cache()
+            cached = disk.get(cache_key)
+            if cached is not None:
+                _log.warning(
+                    "Model fetch failed for %s; using cached list (%d models)",
+                    cache_key,
+                    len(cached),
+                )
+                self._models_cache = list(cached)
+                return list(self._models_cache)
+
+            if is_local:
+                raise ConnectionError(
+                    f"Could not reach local inference server at "
+                    f"{cache_key.split(':', 1)[-1]}: {fetch_err}"
+                ) from fetch_err
+
+            raise ConnectionError(
+                f"Could not fetch models from {cache_key.split(':', 1)[-1]} "
+                f"and no cached model list is available. "
+                f"Please connect to the internet and try again."
+            ) from fetch_err
+
+        self._models_cache = list(models)
+
+        # Persist to disk (merge with existing cache entries).
+        disk = load_model_cache()
+        disk[cache_key] = list(models)
+        save_model_cache(disk)
+
+        return list(self._models_cache)
 
     @abstractmethod
     def validate(self) -> None:

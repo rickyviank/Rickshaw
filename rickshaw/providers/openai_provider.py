@@ -8,6 +8,7 @@ from typing import Any, Iterator
 
 import httpx
 
+from rickshaw.config import is_local_url
 from rickshaw.providers.base import (
     Capabilities,
     EmbeddingMixin,
@@ -207,7 +208,8 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
             data = resp.json()
         return data["data"][0]["embedding"]
 
-    def available_models(self) -> list[str]:
+    def _fetch_models(self) -> list[str]:
+        """Perform a single network fetch of the models list."""
         with httpx.Client(timeout=30) as client:
             resp = client.get(
                 f"{self._base_url}/models",
@@ -216,6 +218,13 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
             resp.raise_for_status()
             data = resp.json()
         return [m["id"] for m in data.get("data", [])]
+
+    def available_models(self) -> list[str]:
+        return self._cached_available_models(
+            self._fetch_models,
+            cache_key=f"openai:{self._base_url}",
+            is_local=is_local_url(self._base_url),
+        )
 
     def validate(self) -> None:
         if not self._api_key:

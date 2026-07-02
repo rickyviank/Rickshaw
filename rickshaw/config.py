@@ -11,9 +11,11 @@ API keys are **always** read from the environment (via each profile's
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 from dotenv import load_dotenv
@@ -35,6 +37,37 @@ class ProviderProfile:
     model: str
     api_key_env: str
     wire_format: str = "openai"
+
+    def is_local_endpoint(self) -> bool:
+        """Return ``True`` when *base_url* points at a loopback or private host.
+
+        Recognised as local: ``localhost``, ``127.0.0.1``, ``::1``,
+        ``0.0.0.0``, any ``*.local`` hostname, and RFC 1918 private addresses
+        (``10.x``, ``192.168.x``, ``172.16-31.x``).
+        """
+        return is_local_url(self.base_url)
+
+
+def is_local_url(url: str) -> bool:
+    """Return ``True`` when *url* points at a loopback or private-network host."""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+    except Exception:
+        return False
+
+    if not host:
+        return False
+
+    _LOCAL_NAMES = {"localhost", "0.0.0.0"}
+    if host in _LOCAL_NAMES or host.endswith(".local"):
+        return True
+
+    try:
+        addr = ipaddress.ip_address(host)
+        return addr.is_loopback or addr.is_private
+    except ValueError:
+        return False
 
 
 def _parse_effort(raw: str) -> Effort:

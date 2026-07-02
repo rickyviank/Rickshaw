@@ -113,3 +113,42 @@ def save_settings(data: dict, path: Path | None = None) -> None:
     path = path or default_settings_path()
     cleaned = _strip_secrets(dict(data))  # shallow copy top-level
     _atomic_write(path, cleaned)
+
+
+# -------------------------------------------------------------------
+# Disk-backed model cache
+# -------------------------------------------------------------------
+
+def _default_cache_path() -> Path:
+    """Return ``~/.rickshaw/models_cache.json``."""
+    return Path.home() / ".rickshaw" / "models_cache.json"
+
+
+def load_model_cache(path: Path | None = None) -> dict[str, list[str]]:
+    """Load the on-disk model cache.
+
+    Returns a mapping of ``"provider_name:base_url"`` → ``list[model_id]``.
+    """
+    path = path or _default_cache_path()
+    if not path.is_file():
+        return {}
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_model_cache(
+    data: dict[str, list[str]], path: Path | None = None
+) -> None:
+    """Persist the model cache atomically.
+
+    API keys are never stored — only provider name, base_url key, and model
+    id lists.
+    """
+    path = path or _default_cache_path()
+    _atomic_write(path, data)
