@@ -261,9 +261,12 @@ def test_service_dedupe_on_write():
     service = MemoryService(embedder=TFIDFEmbedder(dim=32))
     rec1 = service.write("the sky is blue")
     assert rec1 is not None
-    # Same text should be deduped
+    # Same text should be deduped — Phase 4: update-on-duplicate returns the
+    # existing record with bumped use_count instead of None.
     rec2 = service.write("the sky is blue")
-    assert rec2 is None
+    assert rec2 is not None
+    assert rec2.id == rec1.id
+    assert rec2.use_count >= 1  # was bumped by the duplicate write
 
 
 def test_service_write_different_texts():
@@ -278,8 +281,11 @@ def test_service_write_observations():
     service = MemoryService(embedder=TFIDFEmbedder(dim=32))
     resp = Response(text="Hello, I'm the assistant", model="test", usage=TokenUsage())
     records = service.write_observations(resp)
-    assert len(records) == 1
-    assert records[0].text == "Hello, I'm the assistant"
+    # Phase 4: distillation splits into atomic records. A short single-sentence
+    # response produces at least one record.
+    assert len(records) >= 1
+    # The distilled text should contain the assistant's content.
+    assert any("assistant" in r.text.lower() for r in records)
 
 
 def test_service_write_observations_empty_text():
@@ -731,3 +737,166 @@ def test_hybrid_fts_index_stays_in_sync_on_delete():
     store.delete("r1")
     hits = retriever.retrieve("unique searchable phrase", scope_filter=[MemoryScope.GLOBAL], limit=5)
     assert not any(r.id == "r1" for r, _ in hits)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: better memory writing (distillation, dedup, pinning, personability)
+# ---------------------------------------------------------------------------
+
+from rickshaw.memory.distill import distill_turn, _classify_type, _is_sensitive
+
+
+def test_distill_heuristic_extracts_preferences_from_user_input():
+    """The heuristic distiller extracts preference records from user input."""
+    records = distill_turn(
+        user_input="I prefer dark mode and I like concise answers",
+        assistant_text="Got it, I'll keep responses concise.",
+        scope=MemoryScope.SESSION,
+    )
+    prefs = [r for r in records if r.type == MemoryType.PREFERENCE]
+    assert len(prefs) >= 1
+    assert all(r.scope == MemoryScope.GLOBAL for r in prefs)
+    assert all(r.pinned for r in prefs)
+
+
+def test_distill_heuristic_classifies_types():
+    """The heuristic distiller classifies record types correctly."""
+    assert _classify_type("we decided to use PostgreSQL") == MemoryType.DECISION
+    assert _classify_type("the build failed with an error") == MemoryType.ERROR
+    assert _classify_type("I prefer Python over Java") == MemoryType.PREFERENCE
+    assert _classify_type("the sky is blue") == MemoryType.FACT
+
+
+def test_distill_heuristic_detects_sensitive():
+    """The heuristic distiller marks sensitive content."""
+    assert _is_sensitive("my API key is sk-abc123")
+    assert _is_sensitive("the password is hunter2")
+    assert not _is_sensitive("the sky is blue")
+
+
+def test_distill_heuristic_splits_atomic_records():
+    """The distiller splits multi-sentence text into atomic records."""
+    records = distill_turn(
+        user_input="",
+        assistant_text="PostgreSQL is a great database. We decided to use it. The connection failed with an error.",
+        scope=MemoryScope.SESSION,
+    )
+    assert len(records) >= 3
+    types = {r.type for r in records}
+    assert MemoryType.FACT in types
+    assert MemoryType.DECISION in types
+    assert MemoryType.ERROR in types
+
+
+def test_distill_uses_llm_when_provider_reachable():
+    """When a provider is available, LLM distillation is used."""
+    from rickshaw.providers.base import Effort, Message, Response, TokenUsage
+
+    class _DistillProvider:
+        @property
+        def name(self):
+            return "distill-test"
+
+        def complete(self, messages, effort=Effort.LOW, tools=None, **kwargs):
+            return Response(
+                text='[{"text": "user likes dark mode", "type": "preference", "scope": "global", "sensitive": false, "pinned": true}]',
+                model="distill-test",
+                usage=TokenUsage(),
+            )
+
+    records = distill_turn(
+        user_input="I like dark mode",
+        assistant_text="ok",
+        provider=_DistillProvider(),
+    )
+    assert len(records) == 1
+    assert records[0].type == MemoryType.PREFERENCE
+    assert records[0].pinned
+
+
+def test_distill_falls_back_on_llm_failure():
+    """When the LLM call fails, heuristic distillation is used."""
+    class _BrokenProvider:
+        @property
+        def name(self):
+            return "broken"
+
+        def complete(self, messages, effort=None, tools=None, **kwargs):
+            raise ConnectionError("unreachable")
+
+    records = distill_turn(
+        user_input="I prefer dark mode",
+        assistant_text="ok noted",
+        provider=_BrokenProvider(),
+    )
+    # Heuristic fallback still produces records.
+    assert len(records) > 0
+
+
+def test_service_dedup_is_scope_aware():
+    """A session fact and a global fact with similar text are not duplicates."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    r1 = service.write("the project uses Python", scope=MemoryScope.SESSION)
+    r2 = service.write("the project uses Python", scope=MemoryScope.GLOBAL)
+    assert r1 is not None
+    assert r2 is not None
+    assert r1.id != r2.id
+
+
+def test_service_dedup_updates_on_duplicate():
+    """A duplicate bumps use_count and last_used_at instead of discarding."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    r1 = service.write("the sky is blue", scope=MemoryScope.SESSION)
+    assert r1.use_count == 0
+    r2 = service.write("the sky is blue", scope=MemoryScope.SESSION)
+    assert r2.id == r1.id
+    assert r2.use_count == 1
+    assert r2.last_used_at >= r1.last_used_at
+
+
+def test_service_pinning():
+    """Pinning marks a record as always-available to the assembler."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    rec = service.write("user's name is Alice", scope=MemoryScope.GLOBAL)
+    service.pin(rec.id)
+    pinned = service.pinned_records()
+    assert any(r.id == rec.id for r in pinned)
+    service.unpin(rec.id)
+    pinned = service.pinned_records()
+    assert not any(r.id == rec.id for r in pinned)
+
+
+def test_service_write_observations_extracts_preferences():
+    """write_observations extracts preference records from user input."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    resp = Response(text="Got it.", model="test", usage=TokenUsage())
+    records = service.write_observations(resp, user_input="I prefer dark mode for coding")
+    prefs = [r for r in records if r.type == MemoryType.PREFERENCE]
+    assert len(prefs) >= 1
+    assert all(r.scope == MemoryScope.GLOBAL for r in prefs)
+
+
+def test_service_assemble_context_includes_pinned():
+    """Pinned preference records are always in the assembled context."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32), context_budget=5)
+    # Write a pinned preference and an unrelated fact.
+    rec = service.write(
+        "user's name is Alice", scope=MemoryScope.GLOBAL,
+        type=MemoryType.PREFERENCE, pinned=True,
+    )
+    service.write("PostgreSQL is great for OLTP", scope=MemoryScope.GLOBAL)
+    # Query for something completely unrelated — pinned record should still appear.
+    results = service.assemble_context("database transactions")
+    ids = [r.id for r in results]
+    assert rec.id in ids
+
+
+def test_service_write_with_pinned_flag():
+    """write(pinned=True) stores the pinned flag in extra metadata."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    rec = service.write(
+        "I like concise answers", scope=MemoryScope.GLOBAL,
+        type=MemoryType.PREFERENCE, pinned=True,
+    )
+    assert rec is not None
+    assert rec.extra.get("pinned") is True

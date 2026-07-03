@@ -327,6 +327,31 @@ class MemoryStore:
             rows = self._conn.execute("SELECT * FROM memories").fetchall()
         return [self._row_to_record(r) for r in rows]
 
+    def pinned_records(
+        self, scope_filter: list[MemoryScope] | None = None,
+    ) -> list[MemoryRecord]:
+        """Return records marked as pinned in their ``extra`` metadata.
+
+        Pinned records form the compact "about the user" set that is always
+        available to the assembler regardless of the query.
+        """
+        if scope_filter:
+            placeholders = ",".join("?" for _ in scope_filter)
+            rows = self._conn.execute(
+                f"SELECT * FROM memories WHERE scope IN ({placeholders}) "
+                "AND superseded_by IS NULL",
+                [s.value for s in scope_filter],
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM memories WHERE superseded_by IS NULL"
+            ).fetchall()
+        return [
+            self._row_to_record(r)
+            for r in rows
+            if self._row_to_record(r).extra.get("pinned", False)
+        ]
+
     def delete(self, record_id: str) -> bool:
         cursor = self._conn.execute(
             "DELETE FROM memories WHERE id = ?", (record_id,)
