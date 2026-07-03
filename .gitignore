@@ -8,3 +8,7 @@ build/
 .env
 .pytest_cache/
 .mypy_cache/
+.coverage
+# Runtime artifacts
+rickshaw_memory.db
+*.sqlite3

@@ -1,4 +1,11 @@
-"""OpenAI provider implementation."""
+"""OpenAI provider — a sync facade over :mod:`rickshaw_ai`.
+
+Request translation, HTTP, retries, and streaming are delegated to
+``rickshaw_ai``'s OpenAI-compatible adapter. This class keeps the harness's
+synchronous :class:`~rickshaw.providers.base.LLMProvider` contract (and its
+embeddings/model-listing helpers, which live outside ``rickshaw_ai``'s
+tool-calling scope).
+"""
 
 from __future__ import annotations
 
@@ -9,6 +16,7 @@ from typing import Any, Iterator
 import httpx
 
 from rickshaw.config import is_local_url
+from rickshaw.providers import _bridge
 from rickshaw.providers.base import (
     Capabilities,
     EmbeddingMixin,
@@ -18,8 +26,8 @@ from rickshaw.providers.base import (
     Response,
     ToolCall,
     ToolSpec,
-    TokenUsage,
 )
+from rickshaw_ai.registry import ModelInfo, ProviderInfo
 
 _EFFORT_MAP: dict[Effort, str] = {
     Effort.LOW: "low",
@@ -31,7 +39,6 @@ _MODELS_SUPPORTING_EFFORT = {"o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4
 
 
 def _model_supports_effort(model: str) -> bool:
-    base = model.split("-")[0] if "-" in model else model
     return any(model.startswith(prefix) for prefix in _MODELS_SUPPORTING_EFFORT)
 
 
@@ -64,13 +71,32 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
             "Content-Type": "application/json",
         }
 
+    # -- rickshaw_ai wiring ------------------------------------------------
+
+    def _provider_info(self) -> ProviderInfo:
+        return ProviderInfo(
+            id="openai",
+            base_url=self._base_url,
+            protocol="openai",
+            api_key_header="Authorization",
+            api_key_prefix="Bearer ",
+        )
+
+    def _model_info(self) -> ModelInfo:
+        return ModelInfo(
+            id=f"openai/{self._model}",
+            provider_id="openai",
+            model=self._model,
+            supports_tools=True,
+            supports_reasoning=_model_supports_effort(self._model),
+            supports_vision_input=True,
+        )
+
+    # -- tool-call parsing (canonical helpers, reused by the response map) --
+
     @staticmethod
     def _parse_tool_calls(raw_calls: list[dict[str, Any]]) -> list[ToolCall]:
-        """Parse OpenAI-format tool calls into normalized :class:`ToolCall`s.
-
-        Handles the ``{"function": {"name": ..., "arguments": "..."}}`` shape,
-        where ``arguments`` is a JSON-encoded string.
-        """
+        """Parse OpenAI-format tool calls into normalized :class:`ToolCall`s."""
         parsed: list[ToolCall] = []
         for raw_call in raw_calls:
             func = raw_call.get("function", {})
@@ -104,6 +130,8 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
             for t in tools
         ]
 
+    # -- completion / streaming (delegated) --------------------------------
+
     def complete(
         self,
         messages: list[Message],
@@ -112,47 +140,21 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
         tool_choice: str | None = None,
         **kwargs: Any,
     ) -> Response:
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
-        }
-
-        if _model_supports_effort(self._model):
-            payload["reasoning_effort"] = _EFFORT_MAP[effort]
-
-        if tools:
-            payload["tools"] = self._tools_payload(tools)
-            if tool_choice is not None:
-                payload["tool_choice"] = tool_choice
-
-        payload.update(kwargs)
-
-        with httpx.Client(timeout=120) as client:
-            resp = client.post(
-                f"{self._base_url}/chat/completions",
-                headers=self._headers(),
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        choice = data["choices"][0]
-        message = choice["message"]
-        usage_data = data.get("usage", {})
-
-        parsed_tool_calls = self._parse_tool_calls(message.get("tool_calls", []))
-
-        return Response(
-            text=message.get("content") or "",
-            model=data.get("model", self._model),
-            usage=TokenUsage(
-                prompt_tokens=usage_data.get("prompt_tokens", 0),
-                completion_tokens=usage_data.get("completion_tokens", 0),
-                total_tokens=usage_data.get("total_tokens", 0),
-            ),
-            effort=effort,
-            raw=data,
-            tool_calls=parsed_tool_calls,
+        req = _bridge.GenerateRequest(
+            messages=_bridge.to_ai_messages(messages),
+            tools=_bridge.to_ai_tools(tools),
+            tool_choice=tool_choice if tools else None,
+            reasoning=_bridge.Reasoning(effort=_EFFORT_MAP[effort]),
+            provider_options=dict(kwargs),
+        )
+        result = _bridge.generate(
+            self._provider_info(), self._model_info(), self._api_key, req
+        )
+        raw = result.metadata.get("raw", {})
+        message = (raw.get("choices") or [{}])[0].get("message", {})
+        tool_calls = self._parse_tool_calls(message.get("tool_calls", []))
+        return _bridge.to_response(
+            result, effort=effort, tool_calls=tool_calls, fallback_model=self._model
         )
 
     def stream(
@@ -163,39 +165,16 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
         tool_choice: str | None = None,
         **kwargs: Any,
     ) -> Iterator[str]:
-        # TODO: streaming tool-call parsing can be deferred
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
-            "stream": True,
-        }
+        req = _bridge.GenerateRequest(
+            messages=_bridge.to_ai_messages(messages),
+            reasoning=_bridge.Reasoning(effort=_EFFORT_MAP[effort]),
+            provider_options=dict(kwargs),
+        )
+        yield from _bridge.stream_text(
+            self._provider_info(), self._model_info(), self._api_key, req
+        )
 
-        if _model_supports_effort(self._model):
-            payload["reasoning_effort"] = _EFFORT_MAP[effort]
-
-        payload.update(kwargs)
-
-        with httpx.Client(timeout=120) as client:
-            with client.stream(
-                "POST",
-                f"{self._base_url}/chat/completions",
-                headers=self._headers(),
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[len("data: "):]
-                    if data_str.strip() == "[DONE]":
-                        break
-                    import json
-
-                    chunk = json.loads(data_str)
-                    delta = chunk["choices"][0].get("delta", {})
-                    content = delta.get("content")
-                    if content:
-                        yield content
+    # -- embeddings / model listing (outside rickshaw_ai scope) ------------
 
     def embed(self, text: str) -> list[float]:
         with httpx.Client(timeout=60) as client:
@@ -209,12 +188,8 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
         return data["data"][0]["embedding"]
 
     def _fetch_models(self) -> list[str]:
-        """Perform a single network fetch of the models list."""
         with httpx.Client(timeout=30) as client:
-            resp = client.get(
-                f"{self._base_url}/models",
-                headers=self._headers(),
-            )
+            resp = client.get(f"{self._base_url}/models", headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
         return [m["id"] for m in data.get("data", [])]
@@ -233,10 +208,7 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
                 "Set the environment variable or pass api_key to the provider."
             )
         with httpx.Client(timeout=15) as client:
-            resp = client.get(
-                f"{self._base_url}/models",
-                headers=self._headers(),
-            )
+            resp = client.get(f"{self._base_url}/models", headers=self._headers())
             resp.raise_for_status()
 
     def capabilities(self) -> Capabilities:
