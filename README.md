@@ -11,6 +11,12 @@ The slogan captures the two pillars:
 - **your driver** — pick any driver/model behind one normalized interface (OpenAI, Devin, or your own provider) and dial the reasoning effort per session or per turn.
 - **your memory** — a fully offline, user-owned [semantic memory layer](#semantic-memory-layer) that persists and ranks context so it travels with you across providers.
 
+> **`rickshaw-ai`** — the provider layer is now a standalone, importable package,
+> [`rickshaw_ai`](rickshaw_ai/README.md): a unified async LLM API with provider
+> collections, automatic auth resolution (API key + OAuth), token & cost
+> tracking, streaming tool calls, and cross-provider session hand-off. The
+> harness's `rickshaw/providers/` is a thin synchronous facade over it.
+
 ## Setup
 
 ```bash
