@@ -15,6 +15,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -55,6 +56,29 @@ def build_authorize_url(
     return f"{config.authorize_url}{sep}{query}"
 
 
+def _parse_callback(raw: str) -> tuple[str, str | None]:
+    """Extract ``(authorization_code, state)`` from a callback value.
+
+    Accepted formats:
+
+    * Full redirect URL with ``?code=…&state=…`` query parameters.
+    * ``CODE#STATE`` fragment.
+    * Bare ``CODE``.
+    """
+    if "?" in raw:
+        qs = parse_qs(urlparse(raw).query) if "://" in raw else parse_qs(raw.split("?", 1)[1])
+        code = qs.get("code", [None])[0]
+        returned_state = qs.get("state", [None])[0]
+        if code:
+            return code, returned_state
+
+    if "#" in raw:
+        parts = raw.split("#", 1)
+        return parts[0].split("&", 1)[0], parts[1].split("&", 1)[0] or None
+
+    return raw.split("&", 1)[0], None
+
+
 def _credential_from_token(data: dict) -> OAuthCredential:
     expires_in = data.get("expires_in")
     expires = int((time.time() + float(expires_in)) * 1000) if expires_in else None
@@ -81,9 +105,12 @@ class OAuthClient:
         state = base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode()
         url = build_authorize_url(self.config, state=state, code_challenge=challenge)
         open_browser(url)
-        code = await prompt_code()
-        # The user may paste "code#state" or "code" — take the code portion.
-        code = code.strip().split("#", 1)[0].split("&", 1)[0]
+        raw = (await prompt_code()).strip()
+        code, returned_state = _parse_callback(raw)
+        if returned_state is not None and returned_state != state:
+            raise AuthError(
+                "OAuth state mismatch — possible CSRF; please retry login"
+            )
 
         form = {
             "grant_type": "authorization_code",

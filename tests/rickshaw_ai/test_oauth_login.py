@@ -6,8 +6,11 @@ import httpx
 import pytest
 import respx
 
+from urllib.parse import parse_qs, urlparse
+
 from rickshaw_ai import InMemoryCredentialStore, OAuthCredential, create_models
-from rickshaw_ai.auth.oauth import generate_pkce
+from rickshaw_ai.auth.oauth import _parse_callback, generate_pkce
+from rickshaw_ai.errors import AuthError
 from rickshaw_ai.registry import ModelInfo, OAuthConfig, ProviderInfo
 
 AUTHORIZE = "https://oauth.example/authorize"
@@ -45,7 +48,9 @@ async def test_auth_code_login_persists_credential():
         seen["url"] = url
 
     async def _code():
-        return "the-code#state123"
+        # Extract the state from the authorize URL so we return a matching one.
+        qs = parse_qs(urlparse(seen["url"]).query)
+        return f"the-code#{qs['state'][0]}"
 
     await models.login("acme", open_browser=_open, prompt_code=_code)
 
@@ -76,3 +81,34 @@ async def test_device_code_login_polls_until_token():
     cred = await store.read("acme")
     assert isinstance(cred, OAuthCredential)
     assert cred.access == "acc2"
+
+
+@respx.mock
+async def test_auth_code_login_rejects_state_mismatch():
+    """A mismatched state value should raise AuthError (CSRF protection)."""
+    respx.post(TOKEN).mock(return_value=httpx.Response(
+        200, json={"access_token": "acc", "expires_in": 3600}))
+    store = InMemoryCredentialStore()
+    models = create_models(providers=[_provider()], credentials=store)
+
+    def _open(url):
+        pass
+
+    async def _code():
+        return "the-code#wrong-state"
+
+    with pytest.raises(AuthError, match="state mismatch"):
+        await models.login("acme", open_browser=_open, prompt_code=_code)
+
+
+@pytest.mark.parametrize("raw,expected_code,expected_state", [
+    ("bare-code", "bare-code", None),
+    ("code#st", "code", "st"),
+    ("https://redir.test/cb?code=abc&state=xyz", "abc", "xyz"),
+    ("https://redir.test/cb?code=abc", "abc", None),
+    ("?code=abc&state=xyz", "abc", "xyz"),
+])
+def test_parse_callback(raw, expected_code, expected_state):
+    code, state = _parse_callback(raw)
+    assert code == expected_code
+    assert state == expected_state

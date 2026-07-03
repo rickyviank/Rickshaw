@@ -152,9 +152,15 @@ class FileCredentialStore:
 
     async def modify(self, provider_id: str, fn: ModifyFn) -> Credential | None:
         async with self._async_lock(provider_id):
-            return await asyncio.to_thread(self._modify_locked, provider_id, fn)
+            loop = asyncio.get_running_loop()
+            return await asyncio.to_thread(self._modify_locked, provider_id, fn, loop)
 
-    def _modify_locked(self, provider_id: str, fn: ModifyFn) -> Credential | None:
+    def _modify_locked(
+        self,
+        provider_id: str,
+        fn: ModifyFn,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Credential | None:
         lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with open(lock_path, "w") as lock_file:
@@ -162,7 +168,10 @@ class FileCredentialStore:
             try:
                 data = self._load()
                 current = data.get(provider_id)
-                new = asyncio.run(_call_fn(fn, current))
+                future = asyncio.run_coroutine_threadsafe(
+                    _call_fn(fn, current), loop,
+                )
+                new = future.result()
                 if new is None:
                     data.pop(provider_id, None)
                 else:
