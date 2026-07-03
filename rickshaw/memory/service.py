@@ -7,6 +7,7 @@ from pathlib import Path
 
 from rickshaw.memory._math import cosine_similarity
 from rickshaw.memory.embedder import Embedder, Model2VecEmbedder, TFIDFEmbedder
+from rickshaw.memory.hybrid import CrossEncoderReranker, HybridRetriever
 from rickshaw.memory.ranker import Ranker
 from rickshaw.memory.record import MemoryRecord, MemoryScope, MemoryType
 from rickshaw.memory.store import MemoryStore
@@ -33,12 +34,25 @@ class MemoryService:
         db_path: str | Path = ":memory:",
         dedupe_threshold: float = _DEDUPE_THRESHOLD,
         context_budget: int = 10,
+        hybrid: bool = True,
+        reranker: CrossEncoderReranker | None = None,
     ) -> None:
         self.embedder = embedder or Model2VecEmbedder()
         self.store = store or MemoryStore(db_path, vector_dim=self.embedder.dimension)
         self.ranker = ranker or Ranker()
         self.dedupe_threshold = dedupe_threshold
         self.context_budget = context_budget
+        # Phase 3: hybrid retrieval (FTS5 BM25 + dense KNN, fused via RRF).
+        # When enabled, assemble_context uses the hybrid retriever instead of
+        # dense-only search. Falls back to dense-only if FTS5 is unavailable.
+        self.retriever: HybridRetriever | None = None
+        if hybrid:
+            self.retriever = HybridRetriever(
+                self.store, self.embedder, reranker=reranker,
+            )
+            # Wire the FTS5 index into the store so puts/deletes stay in sync.
+            if self.retriever._fts is not None:
+                self.store.register_fts_index(self.retriever._fts)
         # If the embedder tier changed (dimension mismatch), re-embed all
         # existing records so they live in the new vector space. This makes
         # tier switches safe without losing stored memories.
@@ -56,17 +70,30 @@ class MemoryService:
         for record in records:
             record.embedding = self.embedder.embed(record.text)
             self.store.put(record)
+        # Re-sync the FTS index after re-embedding (texts unchanged, but the
+        # store.put path updates the FTS index automatically).
 
     def assemble_context(
         self,
         query: str,
         scope_filter: list[MemoryScope] | None = None,
     ) -> list[MemoryRecord]:
-        """Embed *query* locally, search store with scope filter, rank, return budget-bounded."""
+        """Retrieve relevant memories via hybrid search, rank, return budget-bounded.
+
+        When hybrid retrieval is enabled, runs FTS5 BM25 + dense KNN, fuses via
+        RRF, and feeds the fused candidates into the Ranker. Otherwise falls
+        back to dense-only search. The egress/privacy boundary (excluding
+        sensitive records) is enforced before ranking in both paths.
+        """
         if scope_filter is None:
             scope_filter = [MemoryScope.GLOBAL, MemoryScope.SESSION]
-        query_vec = self.embedder.embed(query)
-        candidates = self.store.search(query_vec, scope_filter=scope_filter)
+        if self.retriever is not None:
+            candidates = self.retriever.retrieve(
+                query, scope_filter=scope_filter, limit=max(self.context_budget * 2, 20),
+            )
+        else:
+            query_vec = self.embedder.embed(query)
+            candidates = self.store.search(query_vec, scope_filter=scope_filter)
         # Egress/privacy boundary: exclude sensitive records BEFORE ranking so
         # the context budget is filled entirely with shareable records (the
         # ranker and prompt builder never see sensitive data).

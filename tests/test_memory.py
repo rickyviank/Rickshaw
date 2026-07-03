@@ -625,3 +625,109 @@ def test_service_reembeds_on_tier_change(tmp_path):
     # Retrieval should still work after re-embedding.
     results = svc_m2v.assemble_context("dark mode preference")
     assert len(results) > 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: hybrid retrieval (FTS5 BM25 + dense KNN + RRF)
+# ---------------------------------------------------------------------------
+
+from rickshaw.memory.hybrid import (
+    HybridRetriever,
+    FTS5Index,
+    reciprocal_rank_fusion,
+)
+
+
+def test_rrf_fuses_ranked_lists():
+    """RRF combines two ranked lists, rewarding items that appear in both."""
+    list_a = [("a", 0.9), ("b", 0.8), ("c", 0.7)]
+    list_b = [("b", 0.95), ("c", 0.6), ("d", 0.5)]
+    fused = reciprocal_rank_fusion([list_a, list_b], k=60)
+    # 'b' and 'c' appear in both lists so should outrank 'a' and 'd'.
+    assert fused["b"] > fused["a"]
+    assert fused["c"] > fused["a"]
+    assert fused["b"] > fused["d"]
+
+
+def test_fts5_index_search_returns_relevant():
+    """FTS5 BM25 returns records whose text matches the query terms."""
+    store = MemoryStore(vector_dim=8, use_vector_index=False)
+    store.put(MemoryRecord(id="r1", text="the quick brown fox jumps", embedding=[1.0] * 8, scope=MemoryScope.GLOBAL))
+    store.put(MemoryRecord(id="r2", text="database transaction isolation", embedding=[1.0] * 8, scope=MemoryScope.GLOBAL))
+    fts = FTS5Index(store._conn)
+    fts.upsert(MemoryRecord(id="r1", text="the quick brown fox jumps", embedding=[], scope=MemoryScope.GLOBAL))
+    fts.upsert(MemoryRecord(id="r2", text="database transaction isolation", embedding=[], scope=MemoryScope.GLOBAL))
+    hits = fts.search("fox", scope_filter=None, limit=5)
+    ids = [h[0] for h in hits]
+    assert "r1" in ids
+    assert "r2" not in ids
+
+
+def test_fts5_index_scope_filter():
+    """FTS5 search respects scope filtering."""
+    store = MemoryStore(vector_dim=8, use_vector_index=False)
+    fts = FTS5Index(store._conn)
+    fts.upsert(MemoryRecord(id="r1", text="dark mode preference", embedding=[], scope=MemoryScope.GLOBAL))
+    fts.upsert(MemoryRecord(id="r2", text="dark mode setting", embedding=[], scope=MemoryScope.SESSION))
+    hits = fts.search("dark mode", scope_filter=[MemoryScope.GLOBAL], limit=5)
+    assert all(h[0] == "r1" for h in hits)
+    assert len(hits) == 1
+
+
+def test_hybrid_retriever_combines_lexical_and_dense():
+    """HybridRetriever fuses BM25 + dense results via RRF."""
+    store = MemoryStore(vector_dim=128, use_vector_index=False)
+    embedder = Model2VecEmbedder()
+    retriever = HybridRetriever(store, embedder)
+    assert retriever.lexical_enabled
+    # Write a record with a distinctive term (great for lexical) and semantic content.
+    retriever.store.put(MemoryRecord(
+        id="r1", text="user prefers dark mode for editing code",
+        embedding=embedder.embed("user prefers dark mode for editing code"),
+        scope=MemoryScope.GLOBAL,
+    ))
+    retriever.index_record(MemoryRecord(
+        id="r1", text="user prefers dark mode for editing code",
+        embedding=[], scope=MemoryScope.GLOBAL,
+    ))
+    candidates = retriever.retrieve("dark mode preference", scope_filter=[MemoryScope.GLOBAL], limit=5)
+    assert len(candidates) > 0
+    assert candidates[0][0].id == "r1"
+
+
+def test_hybrid_retriever_catches_semantic_match_without_term_overlap():
+    """Hybrid retrieval finds semantically related memories even with no shared words."""
+    service = MemoryService(embedder=Model2VecEmbedder())
+    from rickshaw.memory.record import MemoryScope as MS, MemoryType as MT
+    service.write("I like my editor colors dark with low brightness", scope=MS.GLOBAL, type=MT.PREFERENCE)
+    service.write("PostgreSQL handles concurrent transactions well", scope=MS.GLOBAL, type=MT.FACT)
+    # Query uses different words but same meaning as the first record.
+    results = service.assemble_context("what are my display preferences")
+    texts = [r.text for r in results]
+    assert any("dark" in t.lower() for t in texts)
+
+
+def test_service_hybrid_disabled_falls_back_to_dense():
+    """hybrid=False disables FTS5 and uses dense-only search."""
+    service = MemoryService(embedder=Model2VecEmbedder(dim=None) if False else TFIDFEmbedder(dim=32), hybrid=False)
+    assert service.retriever is None
+    service.write("test memory about cats")
+    results = service.assemble_context("cats")
+    assert len(results) > 0
+
+
+def test_hybrid_fts_index_stays_in_sync_on_delete():
+    """Deleting a record removes it from the FTS5 index too."""
+    store = MemoryStore(vector_dim=8, use_vector_index=False)
+    embedder = TFIDFEmbedder(dim=8)
+    retriever = HybridRetriever(store, embedder)
+    store.register_fts_index(retriever._fts)
+    rec = MemoryRecord(id="r1", text="unique searchable phrase", embedding=[1.0] * 8, scope=MemoryScope.GLOBAL)
+    store.put(rec)
+    # Should find it.
+    hits = retriever.retrieve("unique searchable phrase", scope_filter=[MemoryScope.GLOBAL], limit=5)
+    assert any(r.id == "r1" for r, _ in hits)
+    # Delete and confirm it's gone from both.
+    store.delete("r1")
+    hits = retriever.retrieve("unique searchable phrase", scope_filter=[MemoryScope.GLOBAL], limit=5)
+    assert not any(r.id == "r1" for r, _ in hits)

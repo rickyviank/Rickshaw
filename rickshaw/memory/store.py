@@ -107,6 +107,11 @@ class MemoryStore:
             # If sqlite-vec is unavailable we simply proceed without an index;
             # search() transparently uses the brute-force path.
 
+        # Phase 3: optional FTS5 index for hybrid retrieval. Registered by the
+        # HybridRetriever (see rickshaw/memory/hybrid.py). When registered, the
+        # store keeps it in sync on put/delete/mark_superseded.
+        self._fts_index = None
+
     def _migrate(self) -> None:
         """Add columns introduced after the initial schema and migrate the
         embedding column from JSON text to float32 BLOB."""
@@ -177,6 +182,10 @@ class MemoryStore:
         """Whether the vec0-backed vector index is active."""
         return self._index is not None
 
+    def register_fts_index(self, fts_index) -> None:
+        """Register an FTS5 index (from HybridRetriever) for sync on writes."""
+        self._fts_index = fts_index
+
     def close(self) -> None:
         self._conn.close()
 
@@ -208,6 +217,9 @@ class MemoryStore:
         self._conn.commit()
         if self._index is not None:
             self._index.upsert(record)
+        # Keep the FTS5 index in sync if a hybrid retriever registered one.
+        if self._fts_index is not None:
+            self._fts_index.upsert(record)
 
     def get(self, record_id: str) -> MemoryRecord | None:
         row = self._conn.execute(
@@ -299,6 +311,8 @@ class MemoryStore:
         # Superseded records must not surface in search — drop from the index.
         if self._index is not None:
             self._index.delete(record_id)
+        if self._fts_index is not None:
+            self._fts_index.delete(record_id)
 
     def all_records(
         self, scope_filter: list[MemoryScope] | None = None,
@@ -320,6 +334,8 @@ class MemoryStore:
         self._conn.commit()
         if self._index is not None:
             self._index.delete(record_id)
+        if self._fts_index is not None:
+            self._fts_index.delete(record_id)
         return cursor.rowcount > 0
 
     @staticmethod
