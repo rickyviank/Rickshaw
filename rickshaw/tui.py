@@ -18,9 +18,12 @@ installed -- the framework is imported lazily, only when the app is built.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
 from rickshaw.cli import _EFFORT_NAMES, _build_provider, load_config
+
+logger = logging.getLogger(__name__)
 from rickshaw.config import ProviderProfile, RickshawConfig
 from rickshaw.memory.service import MemoryService
 from rickshaw.orchestrator import Orchestrator
@@ -90,6 +93,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--validate-only",
         action="store_true",
         help="Validate provider connectivity and exit.",
+    )
+    parser.add_argument(
+        "--allow-unvalidated",
+        action="store_true",
+        help=(
+            "Continue launching even when provider validation fails. "
+            "Without this flag, validation failure exits non-zero."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -179,6 +190,12 @@ def make_app(
         .a { color: #9aa0a8; }
         .meta { color: #5c6370; }
         .warn { color: #c98a3d; }
+        .degraded-banner {
+            color: #1a1a1a;
+            background: #c98a3d;
+            text-style: bold;
+            padding: 0 1;
+        }
         #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
         #prompt {
             border: none;
@@ -356,6 +373,7 @@ def make_app(
                 try:
                     models = self.provider.available_models()
                 except Exception as exc:
+                    logger.exception("Failed to list models for /model")
                     self._write(f"Cannot list models: {exc}", "warn")
                     return
                 self._write("  available models:", "meta")
@@ -368,6 +386,7 @@ def make_app(
             try:
                 valid_models = self.provider.available_models()
             except Exception as exc:
+                logger.exception("Failed to validate model %r", arg)
                 self._write(f"Cannot validate model: {exc}", "warn")
                 return
 
@@ -383,6 +402,7 @@ def make_app(
             try:
                 new_provider = _rebuild_provider(self.provider.name, self.cfg, arg)
             except Exception as exc:
+                logger.exception("Failed to switch model to %r", arg)
                 self._write(f"Cannot switch model: {exc}", "warn")
                 return
             self.provider = new_provider
@@ -431,6 +451,7 @@ def make_app(
             try:
                 models = self.provider.available_models()
             except Exception as exc:
+                logger.exception("Failed to list models for /models")
                 self._write(f"Cannot list models: {exc}", "warn")
                 return
             self._write("  available models:", "meta")
@@ -505,6 +526,7 @@ def make_app(
                     )
                     models = temp.available_models()
                 except Exception as exc:
+                    logger.exception("Failed to list models for provider %r", chosen)
                     self._write(f"Cannot list models for {chosen}: {exc}", "warn")
                     self._settings_state = None
                     self._set_hint(_DEFAULT_HINT)
@@ -562,6 +584,7 @@ def make_app(
                     provider_name, self.cfg, model_name,
                 )
             except Exception as exc:
+                logger.exception("Failed to switch provider/model via /settings")
                 self._write(f"Cannot switch: {exc}", "warn")
                 return
             self.provider = new_provider
@@ -636,6 +659,7 @@ def make_app(
                     embedding_model=self.cfg.openai_embedding_model,
                 )
             except Exception as exc:
+                logger.exception("Failed to switch provider to %r", name)
                 self._write(f"Cannot switch provider: {exc}", "warn")
                 return
             self.provider = new_provider
@@ -779,7 +803,10 @@ def make_app(
             if result.tool_calls_made:
                 parts.append(f"{result.tool_calls_made} tool calls")
             if result.degraded:
-                parts.append("degraded · local memory")
+                self._write(
+                    "\u26a0 DEGRADED: provider unreachable \u2014 showing local memory only",
+                    "degraded-banner",
+                )
             if parts:
                 self._write(" · ".join(parts), "meta")
             self._finish_turn()
@@ -846,9 +873,10 @@ def main(argv: list[str] | None = None) -> None:
         provider.validate()
     except Exception as exc:
         print(f"Provider validation failed ({provider_name}): {exc}", file=sys.stderr)
-        if args.validate_only:
+        if args.allow_unvalidated and not args.validate_only:
+            print("--allow-unvalidated set; continuing anyway — calls may fail.\n", file=sys.stderr)
+        else:
             sys.exit(1)
-        print("Continuing anyway; calls may fail.\n", file=sys.stderr)
 
     if args.validate_only:
         print(f"Provider {provider_name!r} validated successfully.")

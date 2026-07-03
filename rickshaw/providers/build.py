@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 from rickshaw.config import ProviderProfile
 from rickshaw.providers.base import LLMProvider
 from rickshaw.providers.factory import get_provider
+
+logger = logging.getLogger(__name__)
 
 
 def build_provider_from_profile(
@@ -23,6 +26,14 @@ def build_provider_from_profile(
     ``profile.api_key_env`` -- never from disk.
     """
     api_key = os.environ.get(profile.api_key_env, "")
+
+    if not api_key and not profile.is_local_endpoint():
+        logger.warning(
+            "API key env var %s is empty for provider %r. "
+            "Validation will fail and requests will be unauthorized.",
+            profile.api_key_env,
+            name,
+        )
 
     if profile.wire_format == "openai":
         return get_provider(

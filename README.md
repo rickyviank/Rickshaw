@@ -76,8 +76,11 @@ rickshaw --provider openai --effort high
 # Or via python -m
 python -m rickshaw --provider openai
 
-# Validate connectivity only
+# Validate connectivity only (exits 0 on success, 1 on failure)
 rickshaw --provider openai --validate-only
+
+# Launch even if validation fails (by default, failure exits non-zero)
+rickshaw --provider openai --allow-unvalidated
 ```
 
 ### Terminal UI
