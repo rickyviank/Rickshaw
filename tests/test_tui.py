@@ -343,6 +343,52 @@ async def test_app_runs_a_turn_through_orchestrator():
 
 
 @pytest.mark.asyncio
+async def test_app_mounts_welcome_panel():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test():
+        welcome = app.query_one("#welcome")
+        rendered = str(welcome.render())
+        assert "o--o  rickshaw" in rendered
+        assert "your driver, your memory" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_no_provider_welcome_shows_none():
+    pytest.importorskip("textual")
+    orch, _provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    app = tui.make_app(orch, None, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test():
+        welcome = app.query_one("#welcome")
+        rendered = str(welcome.render())
+        assert "provider: (none)" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_clear_re_renders_welcome_panel():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        original = app.query_one("#welcome")
+        app.query_one("#prompt").value = "/clear"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        refreshed = app.query_one("#welcome")
+        assert refreshed is not original
+        rendered = " ".join(
+            str(w.render()) for w in app.query_one("#transcript").query("Static")
+        )
+        assert "cleared." in rendered
+
+
+@pytest.mark.asyncio
 async def test_app_effort_command_updates_orchestrator():
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
