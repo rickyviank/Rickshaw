@@ -17,6 +17,7 @@ import pytest
 import respx
 
 from rickshaw.memory.embedder import TFIDFEmbedder
+from rickshaw.history import append_history, default_history_path, load_history
 from rickshaw.memory.service import MemoryService
 from rickshaw.orchestrator import Orchestrator
 from rickshaw.config import ProviderProfile, RickshawConfig
@@ -317,6 +318,60 @@ def test_make_app_builds_instance():
 
 
 @pytest.mark.asyncio
+async def test_app_records_plain_messages_and_slash_commands_in_history():
+    pytest.importorskip("textual")
+    orch, provider, memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "remember milk"
+        await pilot.press("enter")
+
+        stored = False
+        for _ in range(60):
+            if any("Hello from fake" in r.text for r in memory.store.all_records()):
+                stored = True
+                break
+            await pilot.pause(0.05)
+        assert stored
+        for _ in range(60):
+            if not app._turn_active:
+                break
+            await pilot.pause(0.05)
+
+        prompt = app.query_one("#prompt")
+        prompt.value = "/help"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert load_history(default_history_path()) == ["remember milk", "/help"]
+
+
+def test_app_loads_persisted_history_on_construction():
+    pytest.importorskip("textual")
+    append_history("first message")
+    append_history("/help")
+    orch, provider, _memory = _make_orchestrator()
+
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    assert app._history == ["first message", "/help"]
+    assert app._history_pos == 2
+
+
+def test_history_cap_rolls_over_at_1000_entries():
+    entries = [f"entry {i}" for i in range(1005)]
+    for entry in entries:
+        append_history(entry)
+
+    history = load_history()
+    assert len(history) == 1000
+    assert history[0] == "entry 5"
+    assert history[-1] == "entry 1004"
+
+
+@pytest.mark.asyncio
 async def test_app_runs_a_turn_through_orchestrator():
     pytest.importorskip("textual")
     orch, provider, memory = _make_orchestrator(function_calling=False)
@@ -340,6 +395,47 @@ async def test_app_runs_a_turn_through_orchestrator():
         assert "remember milk" in rendered
         # The streamed assistant reply was routed through run_turn into memory.
         assert stored
+
+
+@pytest.mark.asyncio
+async def test_app_history_recall_and_return_to_draft():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "recall this"
+        await pilot.press("enter")
+
+        for _ in range(60):
+            if not app._turn_active:
+                break
+            await pilot.pause(0.05)
+
+        await pilot.press("up")
+        assert app.query_one("#prompt").value == "recall this"
+
+        await pilot.press("down")
+        assert app.query_one("#prompt").value == ""
+
+
+@pytest.mark.asyncio
+async def test_app_history_navigation_is_blocked_during_wizard():
+    pytest.importorskip("textual")
+    append_history("saved history entry")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app._settings_state = {"step": "provider", "providers": ["fake"], "on_launch": False}
+        prompt = app.query_one("#prompt")
+        prompt.value = "draft"
+        prompt.focus()
+
+        await pilot.press("up")
+
+        assert app.query_one("#prompt").value == "draft"
 
 
 @pytest.mark.asyncio

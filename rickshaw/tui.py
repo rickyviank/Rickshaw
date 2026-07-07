@@ -38,6 +38,7 @@ from rickshaw.cli import _EFFORT_NAMES, _build_provider, load_config
 logger = logging.getLogger(__name__)
 from rickshaw.config import ProviderProfile, RickshawConfig
 from rickshaw.memory.service import MemoryService
+from rickshaw.history import append_history, load_history
 from rickshaw.orchestrator import Orchestrator
 from rickshaw.providers.base import Effort, LLMProvider
 from rickshaw.providers.build import build_provider_from_profile
@@ -327,6 +328,8 @@ def make_app(
             self.effort = effort
             self.cfg = cfg
             self.orchestrator.effort = effort
+            self._history: list[str] = load_history()
+            self._history_pos: int = len(self._history)
             self._buffer = ""
             self._current_md: Markdown | None = None
             self._turn_active = False
@@ -432,6 +435,7 @@ def make_app(
                 return
             if not value:
                 return
+            self._record_history(value)
             if value.startswith("/"):
                 self._handle_command(value)
                 return
@@ -442,6 +446,79 @@ def make_app(
                 self._write("A turn is already running; press Esc to interrupt.", "warn")
                 return
             self._start_turn(value)
+
+        def on_key(self, event) -> None:
+            if event.key not in ("up", "down"):
+                return
+            if not self._history_nav_allowed(event.key):
+                return
+            if event.key == "up":
+                moved = self._history_prev()
+            else:
+                moved = self._history_next()
+            if moved:
+                event.prevent_default()
+                event.stop()
+
+        def _record_history(self, value: str) -> None:
+            append_history(value)
+            self._history.append(value)
+            if len(self._history) > 1000:
+                self._history = self._history[-1000:]
+            self._history_pos = len(self._history)
+
+        def _history_nav_allowed(self, direction: str) -> bool:
+            if self._login_state is not None:
+                return False
+            if self._settings_state is not None:
+                return False
+            if self._provider_add_state is not None:
+                return False
+            if self.query("#slashmenu"):
+                return False
+            prompt = self.query_one("#prompt")
+            if not prompt.has_focus:
+                return False
+            return self._prompt_on_boundary_line(direction)
+
+        def _prompt_on_boundary_line(self, direction: str) -> bool:
+            prompt = self.query_one("#prompt")
+            if hasattr(prompt, "document"):
+                cursor_row = prompt.cursor_location[0]
+                last_row = len(prompt.document.lines) - 1
+                if direction == "up":
+                    return cursor_row == 0
+                return cursor_row == last_row
+            return True
+
+        def _set_prompt_text(self, text: str) -> None:
+            prompt = self.query_one("#prompt")
+            if hasattr(prompt, "document"):
+                prompt.text = text
+                try:
+                    prompt.move_cursor(prompt.document.end)
+                except AttributeError:
+                    pass
+            else:
+                prompt.value = text
+                prompt.cursor_position = len(text)
+
+        def _history_prev(self) -> bool:
+            if self._history_pos <= 0:
+                return False
+            self._history_pos -= 1
+            self._set_prompt_text(self._history[self._history_pos])
+            return True
+
+        def _history_next(self) -> bool:
+            if self._history_pos >= len(self._history):
+                return False
+            self._history_pos += 1
+            if self._history_pos == len(self._history):
+                self._set_prompt_text("")
+            else:
+                self._set_prompt_text(self._history[self._history_pos])
+            return True
 
         def _handle_command(self, value: str) -> None:
             parts = value.split(maxsplit=1)
