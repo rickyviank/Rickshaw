@@ -82,6 +82,24 @@ class _FakeProvider(LLMProvider):
         )
 
 
+class _GatedProvider(_FakeProvider):
+    """Fake provider whose stream blocks until released — lets tests observe
+    the in-flight 'thinking' state deterministically."""
+
+    def __init__(self) -> None:
+        super().__init__(function_calling=False)
+        import threading
+
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def stream(self, messages, effort=Effort.MEDIUM, tools=None, **kwargs):
+        self.started.set()
+        self.release.wait(5)
+        for chunk in ("Hello ", "from ", "fake"):
+            yield chunk
+
+
 def _make_orchestrator(function_calling: bool = False):
     provider = _FakeProvider(function_calling=function_calling)
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
@@ -340,6 +358,149 @@ async def test_app_runs_a_turn_through_orchestrator():
         assert "remember milk" in rendered
         # The streamed assistant reply was routed through run_turn into memory.
         assert stored
+
+
+@pytest.mark.asyncio
+async def test_j4_indicator_appears_on_turn_start():
+    pytest.importorskip("textual")
+    provider = _GatedProvider()
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+        for _ in range(100):
+            if provider.started.is_set():
+                break
+            await pilot.pause(0.02)
+
+        indicator = app.query("#turn-indicator")
+        assert len(indicator) > 0
+        assert "Thinking" in str(app.query_one("#turn-indicator").render())
+
+        provider.release.set()
+        for _ in range(200):
+            if len(app.query("#turn-indicator")) == 0:
+                break
+            await pilot.pause(0.02)
+
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static, Markdown")
+        )
+        assert "o--o" in rendered
+        assert "rickshaw" in rendered
+
+
+@pytest.mark.asyncio
+async def test_j4_role_glyphs_present():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hello"
+        await pilot.press("enter")
+        for _ in range(100):
+            if any("Hello from fake" in r.text for r in _memory.store.all_records()):
+                break
+            await pilot.pause(0.02)
+
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static, Markdown")
+        )
+        assert "o--o" in rendered
+        assert "rickshaw" in rendered
+        assert "Hello from fake" in rendered
+
+
+@pytest.mark.asyncio
+async def test_j4_esc_interrupts_running_turn():
+    pytest.importorskip("textual")
+    provider = _GatedProvider()
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+        for _ in range(100):
+            if provider.started.is_set():
+                break
+            await pilot.pause(0.02)
+
+        await pilot.press("escape")
+        await pilot.pause(0.05)
+
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static, Markdown")
+        )
+        assert "(interrupted)" in rendered
+        assert len(app.query("#turn-indicator")) == 0
+        assert app.query_one("#prompt").disabled is False
+
+        provider.release.set()
+        for _ in range(100):
+            await pilot.pause(0.02)
+            if app.query_one("#prompt").disabled is False:
+                break
+
+
+@pytest.mark.asyncio
+async def test_j4_ctrl_c_single_press_cancels_running_turn():
+    pytest.importorskip("textual")
+    provider = _GatedProvider()
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+        for _ in range(100):
+            if provider.started.is_set():
+                break
+            await pilot.pause(0.02)
+
+        with patch.object(app, "exit") as mock_exit:
+            await pilot.press("ctrl+c")
+            await pilot.pause(0.05)
+            assert mock_exit.called is False
+
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static, Markdown")
+        )
+        assert "(interrupted)" in rendered
+
+        provider.release.set()
+        for _ in range(100):
+            await pilot.pause(0.02)
+            if app.query_one("#prompt").disabled is False:
+                break
+
+
+@pytest.mark.asyncio
+async def test_j4_ctrl_c_double_tap_quits():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        with patch.object(app, "exit") as mock_exit:
+            await pilot.press("ctrl+c")
+            await pilot.pause(0.05)
+            assert mock_exit.called is False
+            assert "again to quit" in str(app.query_one("#hint").render())
+
+            await pilot.press("ctrl+c")
+            await pilot.pause(0.05)
+            assert mock_exit.called is True
 
 
 @pytest.mark.asyncio

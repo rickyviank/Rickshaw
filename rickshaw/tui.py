@@ -28,6 +28,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 import webbrowser
 from urllib.parse import quote, urlencode
 
@@ -42,6 +43,7 @@ from rickshaw.orchestrator import Orchestrator
 from rickshaw.providers.base import Effort, LLMProvider
 from rickshaw.providers.build import build_provider_from_profile
 from rickshaw.providers.factory import get_provider
+from rickshaw.prompt.builder import _estimate_tokens
 from rickshaw.settings import load_settings, save_settings
 
 from rickshaw_ai._builtins import default_providers as _builtin_providers
@@ -88,7 +90,10 @@ _COMMANDS = {
 }
 
 _DEFAULT_HINT = "/help  ·  esc interrupt  ·  ^c quit"
-_USER_MARK = "[#d98a3d]\u203a[/]"  # amber angle-quote before each user message
+_USER_MARK = "[#e0a86b]\u203a[/]"  # amber angle-quote before each user message
+# Assistant role label: brand `o--o` glyph (assistant color) + dim `rickshaw`.
+_ASSISTANT_LABEL = "o--o [dim]rickshaw[/]"
+_SPINNER_FRAMES = "|/-\\"  # line spinner, advanced at ~8 fps
 
 _TEXTUAL_MISSING_MSG = (
     "The Rickshaw terminal UI requires Textual, which is not installed.\n"
@@ -276,6 +281,16 @@ def make_app(
         # Near-monochrome with a single amber accent; hairline rules separate
         # turns. Chrome is intentionally almost invisible.
         CSS = """
+        $rk-bg: #0f1113;
+        $rk-surface: #16181b;
+        $rk-border: #2a2f36;
+        $rk-text: #e6e8ea;
+        $rk-meta: #8b929c;
+        $rk-accent: #e0a86b;
+        $rk-assistant: #7fb0c9;
+        $rk-warn: #d98a3d;
+        $rk-error: #d16a5a;
+        $rk-success: #7fae7f;
         Screen { layout: vertical; background: #0e0f11; }
         #head { height: auto; color: #4b5563; padding: 1 3 0 3; }
         #transcript {
@@ -296,6 +311,9 @@ def make_app(
         #transcript > Rule { color: #22252b; margin: 0 0 1 0; }
         .u { color: #dfe2e7; }
         .a { color: #9aa0a8; }
+        .a-label { color: $rk-assistant; }
+        #turn-indicator { color: $rk-meta; height: auto; }
+        #transcript > Markdown.assistant { padding: 0 0 0 2; }
         .meta { color: #5c6370; }
         .warn { color: #c98a3d; }
         .degraded-banner {
@@ -317,7 +335,7 @@ def make_app(
         BINDINGS = [
             Binding("escape", "interrupt", "Interrupt", show=False),
             Binding("ctrl+l", "clear", "Clear", show=False),
-            Binding("ctrl+c", "quit", "Quit", show=False),
+            Binding("ctrl+c", "ctrl_c", "Quit", show=False, priority=True),
         ]
 
         def __init__(self) -> None:
@@ -334,6 +352,20 @@ def make_app(
             self._provider_add_state: dict | None = None
             self._settings_state: dict | None = None
             self._login_state: dict | None = None
+            # J4 streaming-turn state
+            self._turn_seq = 0
+            self._indicator: Static | None = None
+            self._indicator_timer = None
+            self._turn_started = 0.0
+            self._spinner_idx = 0
+            self._live_tokens = 0
+            self._first_token = False
+            self._ctrl_c_pending = False
+            self._ctrl_c_timer = None
+            # Cumulative session usage — exposed for a future status bar.
+            self._session_tokens = 0
+            self._session_tool_calls = 0
+            self._last_usage = None
 
         # ---- layout -----------------------------------------------------
 
@@ -404,8 +436,15 @@ def make_app(
 
         def _begin_assistant(self) -> None:
             self._buffer = ""
-            md = Markdown("")
-            self.query_one("#transcript", VerticalScroll).mount(md)
+            transcript = self.query_one("#transcript", VerticalScroll)
+            label = Static(_ASSISTANT_LABEL, classes="a-label")
+            md = Markdown("", classes="assistant")
+            if self._indicator is not None and self._indicator.parent is not None:
+                transcript.mount(label, before=self._indicator)
+                transcript.mount(md, before=self._indicator)
+            else:
+                transcript.mount(label)
+                transcript.mount(md)
             self._current_md = md
             self._scroll_end()
 
@@ -1138,40 +1177,103 @@ def make_app(
 
         def _start_turn(self, text: str) -> None:
             self._turn_active = True
+            self._turn_seq += 1
+            seq = self._turn_seq
             if self._has_turns:
                 self.query_one("#transcript", VerticalScroll).mount(Rule())
             self._has_turns = True
             self._write(f"{_USER_MARK} {text}", "u")
-            self._begin_assistant()
-            self._set_hint("thinking…  ·  esc to interrupt")
+            # Reset per-turn streaming state; the assistant block is created
+            # lazily when the first token arrives so "Thinking…" shows first.
+            self._buffer = ""
+            self._current_md = None
+            self._first_token = False
+            self._live_tokens = 0
+            self._spinner_idx = 0
+            self._turn_started = time.monotonic()
+            indicator = Static("", id="turn-indicator")
+            self.query_one("#transcript", VerticalScroll).mount(indicator)
+            self._indicator = indicator
+            self._tick_indicator()
+            self._indicator_timer = self.set_interval(1 / 8, self._tick_indicator)
+            self._set_hint("esc to interrupt")
             self.query_one("#prompt", Input).disabled = True
-            self._run_turn(text)
+            self._run_turn(text, seq)
+
+        def _indicator_text(self) -> str:
+            frame = _SPINNER_FRAMES[self._spinner_idx % len(_SPINNER_FRAMES)]
+            secs = int(time.monotonic() - self._turn_started)
+            label = "Streaming…" if self._first_token else "Thinking…"
+            return (
+                f"[#e0a86b]{frame}[/] {label} "
+                f"({secs}s · ~{self._live_tokens} tok · esc to interrupt)"
+            )
+
+        def _tick_indicator(self) -> None:
+            if self._indicator is None:
+                return
+            try:
+                self._indicator.update(self._indicator_text())
+            except Exception:  # pragma: no cover - widget may be gone mid-tick
+                pass
+            self._spinner_idx += 1
+
+        def _stop_indicator(self) -> None:
+            if self._indicator_timer is not None:
+                self._indicator_timer.stop()
+                self._indicator_timer = None
+            if self._indicator is not None:
+                try:
+                    self._indicator.remove()
+                except Exception:  # pragma: no cover
+                    pass
+                self._indicator = None
 
         @work(thread=True, exclusive=True, group="turn")
-        def _run_turn(self, text: str) -> None:
+        def _run_turn(self, text: str, seq: int) -> None:
             def on_delta(chunk: str) -> None:
-                if not self._turn_active:
+                if not self._turn_active or seq != self._turn_seq:
                     return
-                self.call_from_thread(self._append_delta, chunk)
+                self.call_from_thread(self._append_delta, chunk, seq)
 
             try:
                 result = self.orchestrator.run_turn(text, on_delta=on_delta)
             except Exception as exc:  # keep the app alive on unexpected errors
-                self.call_from_thread(self._turn_error, exc)
+                self.call_from_thread(self._turn_error, exc, seq)
                 return
-            self.call_from_thread(self._turn_done, result)
+            self.call_from_thread(self._turn_done, result, seq)
 
-        def _append_delta(self, chunk: str) -> None:
+        def _append_delta(self, chunk: str, seq: int) -> None:
+            if seq != self._turn_seq or not self._turn_active:
+                return
+            if not self._first_token:
+                self._first_token = True
+                self._begin_assistant()
             self._buffer += chunk
             if self._current_md is not None:
                 self._current_md.update(self._buffer)
+            self._live_tokens = _estimate_tokens(self._buffer)
             self._scroll_end()
 
-        def _turn_done(self, result) -> None:
+        def _turn_done(self, result, seq: int) -> None:
+            if seq != self._turn_seq or not self._turn_active:
+                return
+            self._stop_indicator()
+            if not self._first_token:
+                # Nothing streamed (e.g. empty stream or non-delta path).
+                self._first_token = True
+                self._begin_assistant()
             if self._current_md is not None and self._buffer != result.text:
-                # Non-streaming providers deliver everything in one delta; make
-                # sure the final rendered text matches the result exactly.
+                # Non-streaming providers deliver everything at once; make sure
+                # the final rendered text matches the result exactly.
                 self._current_md.update(result.text)
+                self._buffer = result.text
+            # Accumulate authoritative session totals for a future status bar.
+            if result.usage is not None:
+                self._session_tokens += result.usage.total_tokens
+            self._session_tool_calls += result.tool_calls_made
+            self._last_usage = result.usage
+            # End-of-turn meta line uses the AUTHORITATIVE real usage totals.
             # Keep the transcript quiet: only surface a dim meta line when there
             # is something noteworthy (tokens, tool calls, or degradation).
             parts: list[str] = []
@@ -1188,12 +1290,16 @@ def make_app(
                 self._write(" · ".join(parts), "meta")
             self._finish_turn()
 
-        def _turn_error(self, exc: Exception) -> None:
+        def _turn_error(self, exc: Exception, seq: int) -> None:
+            if seq != self._turn_seq or not self._turn_active:
+                return
+            self._stop_indicator()
             self._write(f"Error: {exc}", "warn")
             self._finish_turn()
 
         def _finish_turn(self) -> None:
             self._turn_active = False
+            self._stop_indicator()
             self._current_md = None
             self._set_hint(_DEFAULT_HINT)
             prompt = self.query_one("#prompt", Input)
@@ -1221,8 +1327,31 @@ def make_app(
             if not self._turn_active:
                 return
             self.workers.cancel_group(self, "turn")
+            self._turn_active = False
+            self._stop_indicator()
             self._write("(interrupted)", "warn")
             self._finish_turn()
+
+        def action_ctrl_c(self) -> None:
+            # While a turn runs, a single Ctrl+C cancels it (like Esc) rather
+            # than quitting. Otherwise it's the first tap of double-tap-to-quit.
+            if self._turn_active:
+                self.action_interrupt()
+                return
+            if self._ctrl_c_pending:
+                self.exit()
+                return
+            self._ctrl_c_pending = True
+            self._set_hint("press ctrl+c again to quit")
+            if self._ctrl_c_timer is not None:
+                self._ctrl_c_timer.stop()
+            self._ctrl_c_timer = self.set_timer(1.5, self._reset_ctrl_c)
+
+        def _reset_ctrl_c(self) -> None:
+            self._ctrl_c_pending = False
+            self._ctrl_c_timer = None
+            if not self._turn_active:
+                self._set_hint(_DEFAULT_HINT)
 
         def action_clear(self) -> None:
             self.query_one("#transcript", VerticalScroll).remove_children()
