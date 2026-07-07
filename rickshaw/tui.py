@@ -418,13 +418,13 @@ def make_app(
               background: transparent;
           }
           #transcript > Rule { color: $rk-border; margin: 0 0 1 0; }
+          #transcript > Markdown.assistant { padding: 0 0 0 2; }
           .u { color: $rk-text; }
           .a { color: $rk-meta; }
           .a-label { color: $rk-assistant; }
           .meta { color: $rk-meta; }
           .warn { color: $rk-warn; }
           #turn-indicator { color: $rk-meta; height: auto; }
-          #transcript > Markdown.assistant { padding: 0 0 0 2; }
           .degraded-banner {
               color: #1a1a1a;
               background: $rk-error;
@@ -432,94 +432,39 @@ def make_app(
               padding: 0 1;
           }
           #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
-          #prompt-box {
-              height: auto;
-              max-height: 12;
-              margin: 0 3 1 3;
-          }
-          #prompt {
-              height: auto;
-              max-height: 12;
-              background: $rk-surface;
-              border: round $rk-border;
-              color: $rk-text;
-          }
-          #statusbar {
-              dock: bottom;
-              height: 1;
+          #slashmenu {
+              display: none;
               background: $rk-surface;
               color: $rk-meta;
-              padding: 0 3;
-          }
-        #transcript {
-            height: 1fr;
-            padding: 1 3;
-            scrollbar-size: 1 1;
-            scrollbar-color: #2a2e37;
-            scrollbar-color-hover: #3a3f47;
-            scrollbar-color-active: #3a3f47;
-            scrollbar-background: $rk-bg;
-        }
-        #transcript > Static { margin: 0 0 1 0; }
-        #transcript > Markdown {
-            margin: 0 0 1 0;
-            padding: 0;
-            background: transparent;
-        }
-          #transcript > Rule { color: $rk-border; margin: 0 0 1 0; }
-          .u { color: $rk-text; }
-          .a { color: $rk-meta; }
-          .a-label { color: $rk-assistant; }
-          .meta { color: $rk-meta; }
-          .warn { color: $rk-warn; }
-          #turn-indicator { color: $rk-meta; height: auto; }
-          #transcript > Markdown.assistant { padding: 0 0 0 2; }
-          .degraded-banner {
-              color: #1a1a1a;
-              background: $rk-error;
-              text-style: bold;
+              border: round $rk-border;
               padding: 0 1;
+              margin: 0 3;
+              height: auto;
           }
-          #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
           #prompt-box {
               height: auto;
               max-height: 12;
               margin: 0 3 1 3;
-          }
-          #prompt {
-              height: auto;
-              max-height: 12;
-              background: $rk-surface;
-              border: round $rk-border;
-              color: $rk-text;
-          }
-          #statusbar {
-              dock: bottom;
-              height: 1;
-              background: $rk-surface;
-              color: $rk-meta;
-              padding: 0 3;
-          }
-        .degraded-banner {
-          .degraded-banner {
-              color: #1a1a1a;
-              background: $rk-error;
-              text-style: bold;
               padding: 0 1;
+              border: round $rk-border;
+              background: transparent;
           }
-          #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
-          #prompt-box {
+          #prompt-box:focus-within { border: round $rk-accent; }
+          #prompt-glyph {
+              width: 2;
               height: auto;
-              max-height: 12;
-              margin: 0 3 1 3;
+              color: $rk-accent;
+              padding: 0;
           }
           #prompt {
               height: auto;
-              max-height: 12;
-              background: $rk-surface;
-              border: round $rk-border;
+              max-height: 10;
+              border: none;
+              padding: 0;
+              background: transparent;
               color: $rk-text;
           }
+          #prompt:focus { border: none; }
           #statusbar {
               dock: bottom;
               height: 1;
@@ -527,51 +472,6 @@ def make_app(
               color: $rk-meta;
               padding: 0 3;
           }
-          
-            text-style: bold;
-            padding: 0 1;
-        }
-        #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
-        #slashmenu {
-            display: none;
-            background: $rk-surface;
-            color: $rk-meta;
-            border: round $rk-border;
-            padding: 0 1;
-            margin: 0 3;
-            height: auto;
-        }
-        #prompt-box {
-            height: auto;
-            max-height: 12;
-            margin: 0 3 1 3;
-            padding: 0 1;
-            border: round $rk-border;
-            background: transparent;
-        }
-        #prompt-box:focus-within { border: round $rk-accent; }
-        #prompt-glyph {
-            width: 2;
-            height: auto;
-            color: $rk-accent;
-            padding: 0;
-        }
-        #prompt {
-            height: auto;
-            max-height: 10;
-            border: none;
-            padding: 0;
-            background: transparent;
-            color: $rk-text;
-        }
-        #prompt:focus { border: none; }
-        #statusbar {
-            dock: bottom;
-            height: 1;
-            background: $rk-surface;
-            color: $rk-meta;
-            padding: 0 3;
-        }
         """
 
         BINDINGS = [
@@ -649,10 +549,6 @@ def make_app(
             self.query_one("#prompt", PromptArea).focus()
             self._update_status_bar()
 
-        def on_resize(self, event) -> None:
-            self._update_status_bar(event.size.width)
-            self._apply_responsive_welcome(event.size.width)
-
         # ---- welcome panel ----------------------------------------------
 
         def _welcome_text(self, compact: bool) -> str:
@@ -694,14 +590,11 @@ def make_app(
 
         def _apply_responsive_welcome(self, width: int | None = None) -> None:
             try:
-                welcome = self.query_one("#welcome")
+                welcome = self.query_one("#welcome", Static)
             except NoMatches:
                 return
             width = width if width is not None else self.size.width
-            if width and width < 80:
-                welcome.add_class("compact")
-            else:
-                welcome.remove_class("compact")
+            welcome.update(self._welcome_text(compact=bool(width) and width < 80))
 
         def on_resize(self, event) -> None:
             self._update_status_bar(event.size.width)
@@ -845,17 +738,6 @@ def make_app(
                     if not dropped:
                         break
             bar.update(" | ".join(self._status_segment(name) for name in visible))
-
-        def _apply_responsive_welcome(self, width: int | None = None) -> None:
-            try:
-                welcome = self.query_one("#welcome")
-            except NoMatches:
-                return
-            width = width if width is not None else self.size.width
-            if width and width < 80:
-                welcome.add_class("compact")
-            else:
-                welcome.remove_class("compact")
 
         def _warn_missing_metadata(self, model_info: object | None) -> list[str]:
             warnings: list[str] = []
@@ -1050,27 +932,6 @@ def make_app(
                 return False
             return self._menu_accept(via_enter=True)
 
-        def on_key(self, event) -> None:
-            if not self._menu_open or not self._menu_items:
-                return
-            if event.key == "up":
-                self._menu_index = (self._menu_index - 1) % len(self._menu_items)
-                self._render_menu()
-                event.stop()
-                event.prevent_default()
-            elif event.key == "down":
-                self._menu_index = (self._menu_index + 1) % len(self._menu_items)
-                self._render_menu()
-                event.stop()
-                event.prevent_default()
-            elif event.key == "tab":
-                if self._menu_accept(via_enter=False):
-                    event.stop()
-                    event.prevent_default()
-            elif event.key == "escape":
-                self._close_menu()
-                event.stop()
-                event.prevent_default()
         def on_key(self, event) -> None:
             if self._menu_open and self._menu_items:
                 if event.key == "up":
@@ -2017,30 +1878,6 @@ def make_app(
         # ---- actions ----------------------------------------------------
 
         def action_interrupt(self) -> None:
-            if self._menu_open:
-                self._close_menu()
-                return
-            if self._login_state is not None:
-                self._login_state = None
-                self._write("(cancelled)", "warn")
-                self._set_hint(_DEFAULT_HINT)
-                return
-            if self._settings_state is not None:
-                self._settings_state = None
-                self._write("(cancelled)", "warn")
-                self._set_hint(_DEFAULT_HINT)
-                return
-            if self._provider_add_state is not None:
-                self._provider_add_state = None
-                self._write("(cancelled)", "warn")
-                self._set_hint(_DEFAULT_HINT)
-                return
-            if self._turn_active:
-                self.workers.cancel_group(self, "turn")
-                self._write("(interrupted)", "warn")
-                self._finish_turn()
-                return
-        def action_interrupt(self) -> None:
             if self._login_state is not None:
                 self._login_state = None
                 self._write("(cancelled)", "warn")
@@ -2063,10 +1900,12 @@ def make_app(
                 self._write("(interrupted)", "warn")
                 self._finish_turn()
                 return
+            if self._menu_open:
+                self._close_menu()
+                return
             prompt = self.query_one("#prompt", PromptArea)
             if prompt.text:
                 prompt.text = ""
-
         def action_ctrl_c(self) -> None:
             # While a turn runs, a single Ctrl+C cancels it (like Esc) rather
             # than quitting. Otherwise it's the first tap of double-tap-to-quit.

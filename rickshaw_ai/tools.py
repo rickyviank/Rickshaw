@@ -143,44 +143,6 @@ def tool(
     return _wrap
 
 
-def _matches_jsonschema_type(value: Any, schema_type: Any) -> bool:
-    if isinstance(schema_type, list):
-        return any(_matches_jsonschema_type(value, item) for item in schema_type)
-    if schema_type == "null":
-        return value is None
-    if schema_type == "boolean":
-        return isinstance(value, bool)
-    if schema_type == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if schema_type == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if schema_type == "string":
-        return isinstance(value, str)
-    if schema_type == "array":
-        return isinstance(value, list)
-    if schema_type == "object":
-        return isinstance(value, dict)
-    return True
-
-
-def _validate_schema_subset(schema: dict[str, Any], arguments: dict[str, Any]) -> None:
-    for field in schema.get("required", []):
-        if field not in arguments:
-            raise ToolInputError(
-                f"invalid tool arguments: missing required field {field!r}"
-            )
-
-    properties = schema.get("properties") or {}
-    for field, field_schema in properties.items():
-        if field not in arguments or not isinstance(field_schema, dict):
-            continue
-        schema_type = field_schema.get("type")
-        if schema_type is not None and not _matches_jsonschema_type(arguments[field], schema_type):
-            raise ToolInputError(
-                f"invalid tool arguments: {field!r} must be of type {schema_type!r}"
-            )
-
-
 def validate_arguments(spec_parameters: dict[str, Any], arguments: dict[str, Any]) -> None:
     """Validate *arguments* against a JSON-Schema *spec_parameters*.
 
@@ -197,7 +159,11 @@ def validate_arguments(spec_parameters: dict[str, Any], arguments: dict[str, Any
             raise ToolInputError(f"invalid tool arguments: {exc.message}") from exc
         return
     except ImportError:
-        _validate_schema_subset(params, arguments)
+        for field in params.get("required", []):
+            if field not in arguments:
+                raise ToolInputError(
+                    f"invalid tool arguments: missing required field {field!r}"
+                )
 
 
 def validate_call(tools: list[Tool], call: ToolCall) -> dict[str, Any]:
