@@ -8,6 +8,7 @@ need the module to import, which does not require Textual at import time.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any, Iterator
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs
@@ -88,6 +89,23 @@ def _make_orchestrator(function_calling: bool = False):
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     orch = Orchestrator(provider=provider, memory=memory)
     return orch, provider, memory
+
+
+def _statusbar_text(app) -> str:
+    return str(app.query_one("#statusbar").render())
+
+
+def _fake_model_info():
+    return SimpleNamespace(
+        id="fake",
+        models=[
+            SimpleNamespace(
+                model="fake-model",
+                context_window=1000,
+                pricing=SimpleNamespace(input=1.0, output=2.0),
+            )
+        ],
+    )
 
 
 # --- module / wiring tests (no Textual needed) -------------------------------
@@ -318,6 +336,7 @@ def test_make_app_builds_instance():
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
 async def test_status_bar_default_shows_all_six_segments_in_order():
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
@@ -326,7 +345,7 @@ async def test_status_bar_default_shows_all_six_segments_in_order():
     async with app.run_test() as pilot:
         await pilot.pause()
         assert str(app.query_one("#statusbar").render()) == (
-            "fake | fake-model | medium | \u2014 | 0 tok | \u2014"
+            "fake | fake-model | medium | — | 0 tok | —"
         )
 
 
@@ -351,7 +370,7 @@ async def test_status_bar_context_dash_when_window_missing():
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app._active_model_info() is None
-        assert "\u2014" in str(app.query_one("#statusbar").render())
+        assert "—" in str(app.query_one("#statusbar").render())
 
 
 def test_load_config_status_bar_custom_and_unknown_ignored(caplog):
@@ -367,6 +386,69 @@ def test_load_config_status_bar_custom_and_unknown_ignored(caplog):
 
 
 @pytest.mark.asyncio
+async def test_app_statusbar_drops_lower_priority_segments_on_narrow_width():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._find_model_info", return_value=_fake_model_info()):
+        async with app.run_test(size=(40, 24)) as pilot:
+            await pilot.pause()
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "$" not in rendered
+            assert "0%" in rendered
+            assert rendered.startswith("fake")
+
+
+@pytest.mark.asyncio
+async def test_app_statusbar_drops_context_and_tokens_at_extreme_narrow_width():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._find_model_info", return_value=_fake_model_info()):
+        async with app.run_test(size=(30, 24)) as pilot:
+            await pilot.pause()
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "$" not in rendered
+            assert "0%" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_statusbar_restores_segments_on_resize():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._find_model_info", return_value=_fake_model_info()):
+        async with app.run_test(size=(200, 24)) as pilot:
+            await pilot.pause()
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "0%" in rendered
+            assert "$0.0000" in rendered
+
+            await pilot.resize_terminal(30, 24)
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "0%" not in rendered
+            assert "$" not in rendered
+
+            await pilot.resize_terminal(200, 24)
+            rendered = _statusbar_text(app)
+            assert "0%" in rendered
+            assert "$0.0000" in rendered
+
 async def test_app_runs_a_turn_through_orchestrator():
     pytest.importorskip("textual")
     orch, provider, memory = _make_orchestrator(function_calling=False)
@@ -545,6 +627,27 @@ async def test_app_clear_re_renders_welcome_panel():
             str(w.render()) for w in app.query_one("#transcript").query("Static")
         )
         assert "cleared." in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_boot_smoke_mounts_core_widgets():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#welcome")
+        app.query_one("#prompt")
+        app.query_one("#statusbar")
+
+        app.query_one("#prompt").value = "/help"
+        await pilot.press("enter")
+        await pilot.pause()
+        rendered = " ".join(
+            str(w.render()) for w in app.query_one("#transcript").query("Static")
+        )
+        assert "/help" in rendered
 
 
 @pytest.mark.asyncio

@@ -87,6 +87,19 @@ _COMMANDS = {
     "/exit": "Exit.",
 }
 
+STATUS_BAR_VOCABULARY = ("provider", "model", "effort", "context", "tokens", "price")
+STATUS_BAR_DEFAULT_SEGMENTS = [
+    "provider",
+    "model",
+    "effort",
+    "context",
+    "tokens",
+    "price",
+]
+STATUS_BAR_KEEP_ALWAYS = {"provider", "model", "effort"}
+STATUS_BAR_DROP_ORDER = ("price", "tokens", "context")
+STATUS_BAR_NARROW_WIDTH = 80
+
 _DEFAULT_HINT = "/help  ·  esc interrupt  ·  ^c quit"
 _USER_MARK = "[#d98a3d]\u203a[/]"  # amber angle-quote before each user message
 _PROMPT_GLYPH = "\u203a"  # in-frame prompt glyph
@@ -259,8 +272,10 @@ def make_app(
         from textual import work
         from textual.app import App, ComposeResult
         from textual.binding import Binding
+        from textual.css.query import NoMatches
         from textual.containers import Horizontal, VerticalScroll
         from textual.message import Message
+        from textual.suggester import SuggestFromList
         from textual.widgets import Markdown, Rule, Static, TextArea
     except ImportError as exc:  # pragma: no cover - exercised via message text
         raise SystemExit(_TEXTUAL_MISSING_MSG) from exc
@@ -336,6 +351,7 @@ def make_app(
             padding: 0 2;
             margin: 0 0 1 0;
         }
+        #welcome.compact { padding: 0 1; }
         #transcript {
             height: 1fr;
             padding: 1 3;
@@ -362,7 +378,7 @@ def make_app(
             text-style: bold;
             padding: 0 1;
         }
-        #hint { height: 1; color: $rk-meta; padding: 0 3 1 3; }
+        #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
         #prompt-box {
             height: auto;
             max-height: 12;
@@ -409,6 +425,24 @@ def make_app(
             self.effort = effort
             self.cfg = cfg
             self.orchestrator.effort = effort
+            settings = load_settings()
+            configured_segments = settings.get(
+                "status_bar", STATUS_BAR_DEFAULT_SEGMENTS,
+            )
+            if not isinstance(configured_segments, list):
+                configured_segments = STATUS_BAR_DEFAULT_SEGMENTS
+            self._status_bar_segments = [
+                name for name in configured_segments
+                if name in STATUS_BAR_VOCABULARY
+            ]
+            self._status_bar_unknown_segments = [
+                name for name in configured_segments
+                if name not in STATUS_BAR_VOCABULARY
+            ]
+            self._status_bar_warning_emitted = False
+            self._status_session_tokens = 0
+            self._status_session_price = 0.0
+            self._status_context_tokens = 0
             self._buffer = ""
             self._current_md: Markdown | None = None
             self._turn_active = False
@@ -452,6 +486,10 @@ def make_app(
             self.query_one("#prompt", PromptArea).focus()
             self._update_status_bar()
 
+        def on_resize(self, event) -> None:
+            self._update_status_bar(event.size.width)
+            self._apply_responsive_welcome(event.size.width)
+
         # ---- welcome panel ----------------------------------------------
 
         def _welcome_text(self, compact: bool) -> str:
@@ -490,6 +528,21 @@ def make_app(
             panel = Static(self._welcome_text(compact=compact), id="welcome")
             self.query_one("#transcript", VerticalScroll).mount(panel)
             self._scroll_end()
+
+        def _apply_responsive_welcome(self, width: int | None = None) -> None:
+            try:
+                welcome = self.query_one("#welcome")
+            except NoMatches:
+                return
+            width = width if width is not None else self.size.width
+            if width and width < 80:
+                welcome.add_class("compact")
+            else:
+                welcome.remove_class("compact")
+
+        def on_resize(self, event) -> None:
+            self._update_status_bar(event.size.width)
+            self._apply_responsive_welcome(event.size.width)
 
         # ---- on-launch provider picker ---------------------------------
 
@@ -540,40 +593,51 @@ def make_app(
         def _set_hint(self, text: str) -> None:
             self.query_one("#hint", Static).update(text)
 
-        # ---- status bar ------------------------------------------------
+        # ---- status bar ----------------------------------------------
 
         def _active_model_info(self):
-            """Return the active model's ModelInfo (with context_window/pricing) or None."""
+            """Return the active model info (or provider wrapper) if available."""
             if self.provider is None:
                 return None
             model = getattr(self.provider, "_model", "") or ""
-            return _find_model_info(self.provider.name, model)
+            info = _find_model_info(self.provider.name, model)
+            if info is None:
+                return None
+            if hasattr(info, "context_window") or hasattr(info, "pricing"):
+                return info
+            models = getattr(info, "models", None) or []
+            for model_info in models:
+                if getattr(model_info, "model", None) == model or getattr(
+                    model_info, "id", None
+                ) == model:
+                    return model_info
+            return models[0] if models else info
 
         def _context_segment(self) -> str:
             info = self._active_model_info()
-            window = info.context_window if info else 0
+            window = getattr(info, "context_window", 0) if info is not None else 0
             if not window:
                 if not self._ctx_window_warned:
                     logger.warning(
                         "context_window unavailable for active model; rendering '—'"
                     )
                     self._ctx_window_warned = True
-                return "\u2014"
+                return "—"
             pct = (self._last_ctx_tokens / window) * 100
             return f"{pct:.0f}%"
 
         def _price_segment(self) -> str:
-            # Rough estimate off token counts (D8); '—' when model pricing unknown.
-            if self._active_model_info() is None:
-                return "\u2014"
+            info = self._active_model_info()
+            if info is None or not getattr(info, "pricing", None):
+                return "—"
             return f"~${self._session_cost:.4f}"
 
         def _status_segment(self, name: str) -> str:
             if name == "provider":
-                return self.provider.name if self.provider else "\u2014"
+                return self.provider.name if self.provider else "—"
             if name == "model":
                 if self.provider is None:
-                    return "\u2014"
+                    return "—"
                 return getattr(self.provider, "_model", "") or self.provider.name
             if name == "effort":
                 return self.orchestrator.effort.value
@@ -583,16 +647,46 @@ def make_app(
                 return f"{self._session_tokens} tok"
             if name == "price":
                 return self._price_segment()
-            return "\u2014"
+            return "—"
 
-        def _update_status_bar(self) -> None:
+        def _update_status_bar(self, width: int | None = None) -> None:
             try:
                 bar = self.query_one("#statusbar", Static)
             except Exception:
                 return
-            segments = self.cfg.status_bar or []
-            bar.update(" | ".join(self._status_segment(s) for s in segments))
+            segments = [s for s in (self.cfg.status_bar or []) if s in STATUS_BAR_VOCABULARY]
+            if not segments:
+                bar.update("")
+                return
 
+            width = width if width is not None else getattr(self.size, "width", 0) or 0
+            visible = list(segments)
+            if width > 0:
+                content_width = max(0, width - 2)
+                while True:
+                    text = " | ".join(self._status_segment(name) for name in visible)
+                    if len(text) <= content_width:
+                        break
+                    dropped = False
+                    for name in STATUS_BAR_DROP_ORDER:
+                        if name in visible and name not in STATUS_BAR_KEEP_ALWAYS:
+                            visible.remove(name)
+                            dropped = True
+                            break
+                    if not dropped:
+                        break
+            bar.update(" | ".join(self._status_segment(name) for name in visible))
+
+        def _apply_responsive_welcome(self, width: int | None = None) -> None:
+            try:
+                welcome = self.query_one("#welcome")
+            except NoMatches:
+                return
+            width = width if width is not None else self.size.width
+            if width and width < 80:
+                welcome.add_class("compact")
+            else:
+                welcome.remove_class("compact")
         # ---- input handling --------------------------------------------
 
         def on_prompt_area_submitted(self, event: "PromptArea.Submitted") -> None:
@@ -690,6 +784,7 @@ def make_app(
             settings["effort"] = new_effort.value
             save_settings(settings)
             self._write(f"effort · {new_effort.value}", "meta")
+            self._write(f"effort · {new_effort.value}", "meta")
             self._update_status_bar()
 
         def _cmd_model(self, arg: str) -> None:
@@ -755,6 +850,7 @@ def make_app(
             settings["model"] = arg
             settings["effort"] = self.orchestrator.effort.value
             save_settings(settings)
+            self._write(f"model · {arg}", "meta")
             self._write(f"model · {arg}", "meta")
             self._update_status_bar()
 
@@ -950,6 +1046,11 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
+            self._write(
+                f"{provider_name} · {model_name} · effort "
+                f"{self.orchestrator.effort.value}",
+                "meta",
+            )
             self.query_one("#prompt", PromptArea).focus()
             self._update_status_bar()
 
@@ -1024,6 +1125,11 @@ def make_app(
             model = getattr(new_provider, "_model", "") or name
             self._write(
                 f"{name} \u00b7 {model} \u00b7 effort "
+                f"{self.orchestrator.effort.value}",
+                "meta",
+            )
+            self._write(
+                f"{name} · {model} · effort "
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
