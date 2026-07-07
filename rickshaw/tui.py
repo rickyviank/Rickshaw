@@ -88,6 +88,8 @@ _COMMANDS = {
     "/quit": "Exit.",
     "/exit": "Exit.",
 }
+_ARG_COMMANDS = {"/effort", "/model"}
+_EFFORT_VALUES = ["low", "medium", "high"]
 
 STATUS_BAR_VOCABULARY = ("provider", "model", "effort", "context", "tokens", "price")
 STATUS_BAR_DEFAULT_SEGMENTS = [
@@ -529,6 +531,15 @@ def make_app(
             padding: 0 1;
         }
         #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
+        #slashmenu {
+            display: none;
+            background: $rk-surface;
+            color: $rk-meta;
+            border: round $rk-border;
+            padding: 0 1;
+            margin: 0 3;
+            height: auto;
+        }
         #prompt-box {
             height: auto;
             max-height: 12;
@@ -615,11 +626,17 @@ def make_app(
             self._last_ctx_tokens = 0
             self._ctx_window_warned = False
             self._last_usage = None
+            self._menu_open = False
+            self._menu_mode = "command"
+            self._menu_items: list[tuple[str, str]] = []
+            self._menu_index = 0
+            self._menu_arg_cmd = ""
 
         # ---- layout -----------------------------------------------------
 
         def compose(self) -> ComposeResult:
             yield VerticalScroll(id="transcript")
+            yield Static("", id="slashmenu")
             yield Static(_DEFAULT_HINT, id="hint")
             with Horizontal(id="prompt-box"):
                 yield Static(_PROMPT_GLYPH, id="prompt-glyph")
@@ -709,6 +726,7 @@ def make_app(
 
         def _start_provider_picker(self) -> None:
             """Display the provider picker (builtins + configured)."""
+            self._close_menu()
             builtin_names = _get_builtin_provider_names()
             configured_names = sorted(self.cfg.providers)
             all_names = sorted(set(builtin_names) | set(configured_names))
@@ -861,11 +879,157 @@ def make_app(
             for msg in warnings:
                 self._write(f"⚠ {msg}", "warn")
             return warnings
+
+        def _render_menu(self) -> None:
+            menu = self.query_one("#slashmenu", Static)
+            if not self._menu_open or not self._menu_items:
+                menu.update("")
+                return
+
+            from rich.markup import escape
+
+            lines: list[str] = []
+            items = self._menu_items
+            for idx, (value, desc) in enumerate(items):
+                value = escape(value)
+                desc = escape(desc)
+                if self._menu_mode == "command":
+                    body = f"{value:<10} {desc}"
+                else:
+                    body = value
+                if idx == self._menu_index:
+                    lines.append(f"[#e0a86b]›[/] [reverse #e0a86b]{body}[/]")
+                else:
+                    lines.append(f"[#8b929c]  {body}[/]")
+            menu.update("\n".join(lines))
+
+        def _open_menu(
+            self,
+            mode: str,
+            items: list[tuple[str, str]],
+            arg_cmd: str = "",
+        ) -> None:
+            self._menu_open = True
+            self._menu_mode = mode
+            self._menu_items = items
+            self._menu_arg_cmd = arg_cmd
+            if self._menu_items:
+                self._menu_index = min(self._menu_index, len(self._menu_items) - 1)
+            else:
+                self._menu_index = 0
+            self.query_one("#slashmenu", Static).display = True
+            self._render_menu()
+
+        def _close_menu(self) -> None:
+            self._menu_open = False
+            self._menu_mode = "command"
+            self._menu_items = []
+            self._menu_index = 0
+            self._menu_arg_cmd = ""
+            menu = self.query_one("#slashmenu", Static)
+            menu.update("")
+            menu.display = False
+
+        def _menu_accept(self, *, via_enter: bool) -> bool:
+            if not self._menu_open or not self._menu_items:
+                return False
+
+            if self._menu_mode == "value":
+                arg_cmd = self._menu_arg_cmd
+                sel = self._menu_items[self._menu_index][0]
+                self.query_one("#prompt", PromptArea).text = ""
+                self._close_menu()
+                if arg_cmd == "/effort":
+                    self._cmd_effort(sel)
+                elif arg_cmd == "/model":
+                    self._cmd_model(sel)
+                return True
+
+            typed = self.query_one("#prompt", PromptArea).text.strip().lower()
+            exact = typed in _COMMANDS
+            if via_enter and exact:
+                self._close_menu()
+                return False
+
+            cmd = self._menu_items[self._menu_index][0]
+            if cmd in _ARG_COMMANDS:
+                self.query_one("#prompt", PromptArea).text = f"{cmd} "
+                self._close_menu()
+                return True
+
+            self.query_one("#prompt", PromptArea).text = ""
+            self._close_menu()
+            self._handle_command(cmd)
+            return True
         # ---- input handling --------------------------------------------
+
+        def _update_menu_from_prompt(self, text: str) -> None:
+            if (
+                self._login_state is not None
+                or self._settings_state is not None
+                or self._provider_add_state is not None
+                or self._turn_active
+            ):
+                self._close_menu()
+                return
+
+            if not text.startswith("/"):
+                self._close_menu()
+                return
+
+            if " " in text:
+                cmd, _, rest = text.partition(" ")
+                cmd = cmd.lower()
+                if cmd in _ARG_COMMANDS:
+                    if cmd == "/effort":
+                        filter_text = rest.strip().lower()
+                        items = [
+                            (v, "") for v in _EFFORT_VALUES if v.startswith(filter_text)
+                        ]
+                    else:
+                        if self.provider is None:
+                            self._close_menu()
+                            return
+                        try:
+                            models = self.provider.available_models()
+                        except Exception:
+                            self._close_menu()
+                            return
+                        filter_text = rest.strip()
+                        items = [(m, "") for m in models if m.startswith(filter_text)]
+                    if not items:
+                        self._close_menu()
+                        return
+                    self._menu_index = 0
+                    self._open_menu("value", items, arg_cmd=cmd)
+                    return
+                self._close_menu()
+                return
+
+            items = [
+                (name, desc)
+                for name, desc in _COMMANDS.items()
+                if name.startswith(text.lower())
+            ]
+            if not items:
+                self._close_menu()
+                return
+            self._menu_index = 0
+            self._open_menu("command", items)
+
+        def on_text_area_changed(self, event: TextArea.Changed) -> None:
+            if getattr(event.text_area, "id", None) == "prompt":
+                self._update_menu_from_prompt(event.text_area.text)
+
+        def on_prompt_area_changed(self, event: TextArea.Changed) -> None:
+            self.on_text_area_changed(event)
 
         def on_prompt_area_submitted(self, event: "PromptArea.Submitted") -> None:
             value = event.value.strip()
-            self.query_one("#prompt", PromptArea).text = ""
+            prompt = self.query_one("#prompt", PromptArea)
+            if self._menu_open and self._menu_accept_via_enter(value):
+                return
+            prompt.text = ""
             # Wizard intercepts all input while active.
             if self._login_state is not None:
                 self._login_step(value)
@@ -888,6 +1052,39 @@ def make_app(
                 self._write("A turn is already running; press Esc to interrupt.", "warn")
                 return
             self._start_turn(value)
+
+        def _menu_accept_via_enter(self, typed: str) -> bool:
+            if not self._menu_open:
+                return False
+            if self._menu_mode == "value":
+                return self._menu_accept(via_enter=True)
+
+            if typed.strip().lower() in _COMMANDS:
+                self._close_menu()
+                return False
+            return self._menu_accept(via_enter=True)
+
+        def on_key(self, event) -> None:
+            if not self._menu_open or not self._menu_items:
+                return
+            if event.key == "up":
+                self._menu_index = (self._menu_index - 1) % len(self._menu_items)
+                self._render_menu()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "down":
+                self._menu_index = (self._menu_index + 1) % len(self._menu_items)
+                self._render_menu()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "tab":
+                if self._menu_accept(via_enter=False):
+                    event.stop()
+                    event.prevent_default()
+            elif event.key == "escape":
+                self._close_menu()
+                event.stop()
+                event.prevent_default()
 
         def _handle_command(self, value: str) -> None:
             parts = value.split(maxsplit=1)
@@ -1062,6 +1259,7 @@ def make_app(
 
         def _cmd_settings(self) -> None:
             """Interactive provider/model picker with settings header."""
+            self._close_menu()
             prov_name = self.provider.name if self.provider else "(none)"
             model = (getattr(self.provider, "_model", "") or prov_name) if self.provider else "(none)"
             settings = load_settings()
@@ -1311,6 +1509,7 @@ def make_app(
 
         def _cmd_provider_add_start(self) -> None:
             """Begin the interactive provider-registration wizard."""
+            self._close_menu()
             self._provider_add_state = {"step": 0, "data": {}}
             _key, prompt = _PROVIDER_ADD_STEPS[0]
             self._set_hint(f"{prompt}(Enter to submit, Esc to cancel)")
@@ -1380,6 +1579,7 @@ def make_app(
 
         def _start_oauth_login(self, provider_id: str, info=None) -> None:
             """Begin the OAuth login flow for *provider_id*."""
+            self._close_menu()
             if info is None:
                 info = _builtin_provider_info(provider_id)
             if info is None or info.oauth is None:
@@ -1601,6 +1801,7 @@ def make_app(
         # ---- turn execution --------------------------------------------
 
         def _start_turn(self, text: str) -> None:
+            self._close_menu()
             self._turn_active = True
             self._turn_seq += 1
             seq = self._turn_seq
@@ -1744,6 +1945,9 @@ def make_app(
         # ---- actions ----------------------------------------------------
 
         def action_interrupt(self) -> None:
+            if self._menu_open:
+                self._close_menu()
+                return
             if self._login_state is not None:
                 self._login_state = None
                 self._write("(cancelled)", "warn")
