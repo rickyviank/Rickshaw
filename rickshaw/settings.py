@@ -21,6 +21,7 @@ _DEFAULT_SETTINGS: dict = {
     "version": _CURRENT_VERSION,
     "provider": "",
     "effort": "medium",
+    "status_bar": ["provider", "model", "effort", "context", "tokens", "price"],
     "embedding_provider": "openai",
     "embedding_model": "text-embedding-3-small",
     "providers": {},

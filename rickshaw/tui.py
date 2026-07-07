@@ -87,6 +87,19 @@ _COMMANDS = {
     "/exit": "Exit.",
 }
 
+STATUS_BAR_VOCABULARY = ("provider", "model", "effort", "context", "tokens", "price")
+STATUS_BAR_DEFAULT_SEGMENTS = [
+    "provider",
+    "model",
+    "effort",
+    "context",
+    "tokens",
+    "price",
+]
+STATUS_BAR_KEEP_ALWAYS = {"provider", "model", "effort"}
+STATUS_BAR_DROP_ORDER = ("price", "tokens", "context")
+STATUS_BAR_NARROW_WIDTH = 80
+
 _DEFAULT_HINT = "/help  ·  esc interrupt  ·  ^c quit"
 _USER_MARK = "[#d98a3d]\u203a[/]"  # amber angle-quote before each user message
 
@@ -248,6 +261,7 @@ def make_app(
         from textual import work
         from textual.app import App, ComposeResult
         from textual.binding import Binding
+        from textual.css.query import NoMatches
         from textual.containers import VerticalScroll
         from textual.suggester import SuggestFromList
         from textual.widgets import Input, Markdown, Rule, Static
@@ -276,6 +290,16 @@ def make_app(
         # Near-monochrome with a single amber accent; hairline rules separate
         # turns. Chrome is intentionally almost invisible.
         CSS = """
+        $rk-bg: #0f1113;
+        $rk-surface: #16181b;
+        $rk-border: #2a2f36;
+        $rk-text: #e6e8ea;
+        $rk-meta: #8b929c;
+        $rk-accent: #e0a86b;
+        $rk-assistant: #7fb0c9;
+        $rk-warn: #d98a3d;
+        $rk-error: #d16a5a;
+        $rk-success: #7fae7f;
         Screen { layout: vertical; background: #0e0f11; }
         #head { height: auto; color: #4b5563; padding: 1 3 0 3; }
         #transcript {
@@ -305,6 +329,12 @@ def make_app(
             padding: 0 1;
         }
         #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
+        #statusbar {
+            height: 1;
+            background: $rk-surface;
+            color: $rk-meta;
+            padding: 0 1;
+        }
         #prompt {
             border: none;
             background: #0e0f11;
@@ -327,6 +357,24 @@ def make_app(
             self.effort = effort
             self.cfg = cfg
             self.orchestrator.effort = effort
+            settings = load_settings()
+            configured_segments = settings.get(
+                "status_bar", STATUS_BAR_DEFAULT_SEGMENTS,
+            )
+            if not isinstance(configured_segments, list):
+                configured_segments = STATUS_BAR_DEFAULT_SEGMENTS
+            self._status_bar_segments = [
+                name for name in configured_segments
+                if name in STATUS_BAR_VOCABULARY
+            ]
+            self._status_bar_unknown_segments = [
+                name for name in configured_segments
+                if name not in STATUS_BAR_VOCABULARY
+            ]
+            self._status_bar_warning_emitted = False
+            self._status_session_tokens = 0
+            self._status_session_price = 0.0
+            self._status_context_tokens = 0
             self._buffer = ""
             self._current_md: Markdown | None = None
             self._turn_active = False
@@ -346,6 +394,7 @@ def make_app(
                 id="prompt",
                 suggester=SuggestFromList(sorted(_COMMANDS), case_sensitive=False),
             )
+            yield Static("", id="statusbar")
 
         def on_mount(self) -> None:
             if self.provider is None:
@@ -364,7 +413,16 @@ def make_app(
                         "tools off — recall is harness-driven for this provider.",
                         cls="meta",
                     )
+            if self._status_bar_unknown_segments and not self._status_bar_warning_emitted:
+                unknown = ", ".join(self._status_bar_unknown_segments)
+                self._write(f"unknown status_bar segments ignored: {unknown}", "warn")
+                self._status_bar_warning_emitted = True
+            self._refresh_status()
             self.query_one("#prompt", Input).focus()
+
+        def on_resize(self, event) -> None:
+            self._refresh_status(event.size.width)
+            self._apply_responsive_welcome(event.size.width)
 
         # ---- on-launch provider picker ---------------------------------
 
@@ -414,6 +472,85 @@ def make_app(
 
         def _set_hint(self, text: str) -> None:
             self.query_one("#hint", Static).update(text)
+
+        def _active_model_info(self):
+            if self.provider is None:
+                return None
+            provider_info = _builtin_provider_info(self.provider.name)
+            if provider_info is None:
+                return None
+            model_name = getattr(self.provider, "_model", "")
+            for model in provider_info.models:
+                if model.model == model_name:
+                    return model
+            return None
+
+        def _status_segment_text(self, name: str) -> str:
+            if name == "provider":
+                return self.provider.name if self.provider is not None else "—"
+            if name == "model":
+                model = getattr(self.provider, "_model", "") if self.provider else ""
+                return model or "—"
+            if name == "effort":
+                effort = getattr(self.orchestrator, "effort", None)
+                return getattr(effort, "value", None) or "—"
+            if name == "context":
+                model_info = self._active_model_info()
+                if model_info is None or getattr(model_info, "context_window", 0) <= 0:
+                    return "—"
+                pct = round(
+                    100 * self._status_context_tokens / model_info.context_window,
+                )
+                return f"{pct}%"
+            if name == "tokens":
+                return str(self._status_session_tokens)
+            if name == "price":
+                model_info = self._active_model_info()
+                if model_info is None or getattr(model_info, "pricing", None) is None:
+                    return "—"
+                return f"${self._status_session_price:.4f}"
+            return "—"
+
+        def _refresh_status(self, width: int | None = None) -> None:
+            segments = [name for name in self._status_bar_segments if name in STATUS_BAR_VOCABULARY]
+            if not segments:
+                self.query_one("#statusbar", Static).update("")
+                return
+
+            width = width if width is not None else getattr(self.size, "width", 0) or 0
+            if width <= 0:
+                text = " | ".join(self._status_segment_text(name) for name in segments)
+                self.query_one("#statusbar", Static).update(text)
+                return
+
+            content_width = max(0, width - 2)
+            visible = list(segments)
+            while True:
+                text = " | ".join(self._status_segment_text(name) for name in visible)
+                if len(text) <= content_width:
+                    break
+                dropped = False
+                for name in STATUS_BAR_DROP_ORDER:
+                    if name in visible and name not in STATUS_BAR_KEEP_ALWAYS:
+                        visible.remove(name)
+                        dropped = True
+                        break
+                if not dropped:
+                    break
+            self.query_one("#statusbar", Static).update(
+                " | ".join(self._status_segment_text(name) for name in visible),
+            )
+
+        def _apply_responsive_welcome(self, width: int | None = None) -> None:
+            try:
+                welcome = self.query_one("#welcome")
+            except NoMatches:
+                return
+            width = width if width is not None else self.size.width
+            if width and width < STATUS_BAR_NARROW_WIDTH:
+                welcome.add_class("compact")
+            else:
+                welcome.remove_class("compact")
 
         # ---- input handling --------------------------------------------
 
@@ -512,6 +649,7 @@ def make_app(
             settings["effort"] = new_effort.value
             save_settings(settings)
             self._write(f"effort · {new_effort.value}", "meta")
+            self._refresh_status()
 
         def _cmd_model(self, arg: str) -> None:
             if not arg:
@@ -577,6 +715,7 @@ def make_app(
             settings["effort"] = self.orchestrator.effort.value
             save_settings(settings)
             self._write(f"model · {arg}", "meta")
+            self._refresh_status()
 
         def _cmd_memory(self) -> None:
             try:
@@ -770,6 +909,7 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
+            self._refresh_status()
 
         def _cmd_provider(self, arg: str) -> None:
             """Show, switch, or register providers."""
@@ -845,6 +985,7 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
+            self._refresh_status()
 
         def _cmd_provider_add_start(self) -> None:
             """Begin the interactive provider-registration wizard."""

@@ -8,6 +8,7 @@ need the module to import, which does not require Textual at import time.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any, Iterator
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs
@@ -87,6 +88,23 @@ def _make_orchestrator(function_calling: bool = False):
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     orch = Orchestrator(provider=provider, memory=memory)
     return orch, provider, memory
+
+
+def _statusbar_text(app) -> str:
+    return str(app.query_one("#statusbar").render())
+
+
+def _fake_model_info():
+    return SimpleNamespace(
+        id="fake",
+        models=[
+            SimpleNamespace(
+                model="fake-model",
+                context_window=1000,
+                pricing=SimpleNamespace(input=1.0, output=2.0),
+            )
+        ],
+    )
 
 
 # --- module / wiring tests (no Textual needed) -------------------------------
@@ -314,6 +332,71 @@ def test_make_app_builds_instance():
     # Effort is applied to the orchestrator at construction.
     assert orch.effort == Effort.HIGH
     assert app is not None
+
+
+@pytest.mark.asyncio
+async def test_app_statusbar_drops_lower_priority_segments_on_narrow_width():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._builtin_provider_info", return_value=_fake_model_info()):
+        async with app.run_test(size=(40, 24)) as pilot:
+            await pilot.pause()
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "$" not in rendered
+            assert "0%" in rendered
+            assert rendered.startswith("fake")
+
+
+@pytest.mark.asyncio
+async def test_app_statusbar_drops_context_and_tokens_at_extreme_narrow_width():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._builtin_provider_info", return_value=_fake_model_info()):
+        async with app.run_test(size=(30, 24)) as pilot:
+            await pilot.pause()
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "$" not in rendered
+            assert "0%" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_statusbar_restores_segments_on_resize():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._builtin_provider_info", return_value=_fake_model_info()):
+        async with app.run_test(size=(200, 24)) as pilot:
+            await pilot.pause()
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "0%" in rendered
+            assert "$0.0000" in rendered
+
+            await pilot.resize_terminal(30, 24)
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "0%" not in rendered
+            assert "$" not in rendered
+
+            await pilot.resize_terminal(200, 24)
+            rendered = _statusbar_text(app)
+            assert "0%" in rendered
+            assert "$0.0000" in rendered
 
 
 @pytest.mark.asyncio
