@@ -315,8 +315,17 @@ def make_app(
         $rk-warn: #d98a3d;
         $rk-error: #d16a5a;
         $rk-success: #7fae7f;
-        Screen { layout: vertical; background: #0e0f11; }
-        #head { height: auto; color: #4b5563; padding: 1 3 0 3; }
+
+        Screen { layout: vertical; background: $rk-bg; }
+        #welcome {
+            height: auto;
+            width: 1fr;
+            background: $rk-surface;
+            color: $rk-text;
+            border: round $rk-border;
+            padding: 0 2;
+            margin: 0 0 1 0;
+        }
         #transcript {
             height: 1fr;
             padding: 1 3;
@@ -324,7 +333,7 @@ def make_app(
             scrollbar-color: #2a2e37;
             scrollbar-color-hover: #3a3f47;
             scrollbar-color-active: #3a3f47;
-            scrollbar-background: #0e0f11;
+            scrollbar-background: $rk-bg;
         }
         #transcript > Static { margin: 0 0 1 0; }
         #transcript > Markdown {
@@ -332,18 +341,18 @@ def make_app(
             padding: 0;
             background: transparent;
         }
-        #transcript > Rule { color: #22252b; margin: 0 0 1 0; }
-        .u { color: #dfe2e7; }
-        .a { color: #9aa0a8; }
-        .meta { color: #5c6370; }
-        .warn { color: #c98a3d; }
+        #transcript > Rule { color: $rk-border; margin: 0 0 1 0; }
+        .u { color: $rk-text; }
+        .a { color: $rk-meta; }
+        .meta { color: $rk-meta; }
+        .warn { color: $rk-warn; }
         .degraded-banner {
             color: #1a1a1a;
-            background: #c98a3d;
+            background: $rk-error;
             text-style: bold;
             padding: 0 1;
         }
-        #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
+        #hint { height: 1; color: $rk-meta; padding: 0 3 1 3; }
         #prompt-box {
             height: auto;
             max-height: 12;
@@ -394,7 +403,6 @@ def make_app(
         # ---- layout -----------------------------------------------------
 
         def compose(self) -> ComposeResult:
-            yield Static(RICKSHAW_BANNER, id="head")
             yield VerticalScroll(id="transcript")
             yield Static(_DEFAULT_HINT, id="hint")
             with Horizontal(id="prompt-box"):
@@ -402,6 +410,7 @@ def make_app(
                 yield PromptArea(id="prompt")
 
         def on_mount(self) -> None:
+            self._render_welcome()
             if self.provider is None:
                 self._write("no provider selected", cls="meta")
                 self._start_provider_picker()
@@ -419,6 +428,45 @@ def make_app(
                         cls="meta",
                     )
             self.query_one("#prompt", PromptArea).focus()
+
+        # ---- welcome panel ----------------------------------------------
+
+        def _welcome_text(self, compact: bool) -> str:
+            """Rich-markup body for the welcome panel (D2)."""
+            logo = f"[$rk-assistant]{RICKSHAW_LOGO}[/]"
+            if self.provider is None:
+                prov = "provider: (none)"
+                prov_markup = f"[$rk-meta]{prov}[/]"
+            else:
+                model = getattr(self.provider, "_model", "") or self.provider.name
+                prov = (
+                    f"{self.provider.name} \u00b7 {model} \u00b7 effort "
+                    f"{self.orchestrator.effort.value}"
+                )
+                prov_markup = f"[$rk-accent]{prov}[/]"
+            if compact:
+                return (
+                    f"{logo}  [$rk-meta]\u00b7 {RICKSHAW_SLOGAN}[/]\n"
+                    f"{prov_markup}  [$rk-meta]\u00b7  /help[/]"
+                )
+            cwd = os.getcwd()
+            return (
+                f"{logo}\n"
+                f"[$rk-meta]{RICKSHAW_SLOGAN}[/]\n"
+                f"\n"
+                f"{prov_markup}\n"
+                f"[$rk-meta]cwd:[/] {cwd}\n"
+                f"\n"
+                f"[$rk-meta]/help  \u00b7  esc interrupt  \u00b7  ^c quit[/]"
+            )
+
+        def _render_welcome(self) -> None:
+            """Mount the welcome panel at the top of the transcript (launch/clear)."""
+            width = self.size.width
+            compact = bool(width) and width < 80
+            panel = Static(self._welcome_text(compact=compact), id="welcome")
+            self.query_one("#transcript", VerticalScroll).mount(panel)
+            self._scroll_end()
 
         # ---- on-launch provider picker ---------------------------------
 
@@ -824,6 +872,7 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
+            self.query_one("#prompt", Input).focus()
 
         def _cmd_provider(self, arg: str) -> None:
             """Show, switch, or register providers."""
@@ -1284,6 +1333,10 @@ def make_app(
         def action_clear(self) -> None:
             self.query_one("#transcript", VerticalScroll).remove_children()
             self._has_turns = False
+            self.call_after_refresh(self._finish_clear)
+
+        def _finish_clear(self) -> None:
+            self._render_welcome()
             self._write("cleared.", "meta")
 
     return RickshawTUI()
