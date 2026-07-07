@@ -34,8 +34,6 @@ from urllib.parse import quote, urlencode
 import httpx
 
 from rickshaw.cli import _EFFORT_NAMES, _build_provider, load_config
-
-logger = logging.getLogger(__name__)
 from rickshaw.config import ProviderProfile, RickshawConfig
 from rickshaw.memory.service import MemoryService
 from rickshaw.orchestrator import Orchestrator
@@ -49,6 +47,8 @@ from rickshaw_ai.credentials.store import FileCredentialStore
 from rickshaw_ai.factory import builtin_models as _builtin_models
 from rickshaw.providers import _bridge
 from rickshaw.providers._bridge import run_sync
+
+logger = logging.getLogger(__name__)
 
 # Branding — module-level so cli.py can import and reuse them.
 RICKSHAW_LOGO = "o--o  rickshaw"
@@ -181,6 +181,16 @@ def _builtin_provider_info(provider_id: str):
     for p in _builtin_providers():
         if p.id == provider_id:
             return p
+    return None
+
+
+def _find_model_info(provider_id: str, model: str):
+    """Return the ModelInfo for provider_id/model from the builtins, or None."""
+    for p in _builtin_providers():
+        if p.id == provider_id:
+            for m in p.models:
+                if m.model == model:
+                    return m
     return None
 
 
@@ -377,6 +387,13 @@ def make_app(
             color: $rk-text;
         }
         #prompt:focus { border: none; }
+        #statusbar {
+            dock: bottom;
+            height: 1;
+            background: $rk-surface;
+            color: $rk-meta;
+            padding: 0 3;
+        }
         """
 
         BINDINGS = [
@@ -399,6 +416,10 @@ def make_app(
             self._provider_add_state: dict | None = None
             self._settings_state: dict | None = None
             self._login_state: dict | None = None
+            self._session_tokens = 0
+            self._session_cost = 0.0
+            self._last_ctx_tokens = 0
+            self._ctx_window_warned = False
 
         # ---- layout -----------------------------------------------------
 
@@ -408,6 +429,7 @@ def make_app(
             with Horizontal(id="prompt-box"):
                 yield Static(_PROMPT_GLYPH, id="prompt-glyph")
                 yield PromptArea(id="prompt")
+            yield Static("", id="statusbar")
 
         def on_mount(self) -> None:
             self._render_welcome()
@@ -428,6 +450,7 @@ def make_app(
                         cls="meta",
                     )
             self.query_one("#prompt", PromptArea).focus()
+            self._update_status_bar()
 
         # ---- welcome panel ----------------------------------------------
 
@@ -516,6 +539,59 @@ def make_app(
 
         def _set_hint(self, text: str) -> None:
             self.query_one("#hint", Static).update(text)
+
+        # ---- status bar ------------------------------------------------
+
+        def _active_model_info(self):
+            """Return the active model's ModelInfo (with context_window/pricing) or None."""
+            if self.provider is None:
+                return None
+            model = getattr(self.provider, "_model", "") or ""
+            return _find_model_info(self.provider.name, model)
+
+        def _context_segment(self) -> str:
+            info = self._active_model_info()
+            window = info.context_window if info else 0
+            if not window:
+                if not self._ctx_window_warned:
+                    logger.warning(
+                        "context_window unavailable for active model; rendering '—'"
+                    )
+                    self._ctx_window_warned = True
+                return "\u2014"
+            pct = (self._last_ctx_tokens / window) * 100
+            return f"{pct:.0f}%"
+
+        def _price_segment(self) -> str:
+            # Rough estimate off token counts (D8); '—' when model pricing unknown.
+            if self._active_model_info() is None:
+                return "\u2014"
+            return f"~${self._session_cost:.4f}"
+
+        def _status_segment(self, name: str) -> str:
+            if name == "provider":
+                return self.provider.name if self.provider else "\u2014"
+            if name == "model":
+                if self.provider is None:
+                    return "\u2014"
+                return getattr(self.provider, "_model", "") or self.provider.name
+            if name == "effort":
+                return self.orchestrator.effort.value
+            if name == "context":
+                return self._context_segment()
+            if name == "tokens":
+                return f"{self._session_tokens} tok"
+            if name == "price":
+                return self._price_segment()
+            return "\u2014"
+
+        def _update_status_bar(self) -> None:
+            try:
+                bar = self.query_one("#statusbar", Static)
+            except Exception:
+                return
+            segments = self.cfg.status_bar or []
+            bar.update(" | ".join(self._status_segment(s) for s in segments))
 
         # ---- input handling --------------------------------------------
 
@@ -614,6 +690,7 @@ def make_app(
             settings["effort"] = new_effort.value
             save_settings(settings)
             self._write(f"effort · {new_effort.value}", "meta")
+            self._update_status_bar()
 
         def _cmd_model(self, arg: str) -> None:
             if not arg:
@@ -679,6 +756,7 @@ def make_app(
             settings["effort"] = self.orchestrator.effort.value
             save_settings(settings)
             self._write(f"model · {arg}", "meta")
+            self._update_status_bar()
 
         def _cmd_memory(self) -> None:
             try:
@@ -872,7 +950,8 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
-            self.query_one("#prompt", Input).focus()
+            self.query_one("#prompt", PromptArea).focus()
+            self._update_status_bar()
 
         def _cmd_provider(self, arg: str) -> None:
             """Show, switch, or register providers."""
@@ -948,6 +1027,7 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
+            self._update_status_bar()
 
         def _cmd_provider_add_start(self) -> None:
             """Begin the interactive provider-registration wizard."""
@@ -1220,6 +1300,7 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
+            self._update_status_bar()
 
         def _cmd_login(self) -> None:
             """Authenticate (or re-authenticate) the active provider via OAuth."""
@@ -1289,6 +1370,18 @@ def make_app(
                 )
             if parts:
                 self._write(" · ".join(parts), "meta")
+            usage = result.usage
+            if usage is not None:
+                self._session_tokens += usage.total_tokens or 0
+                self._last_ctx_tokens = usage.prompt_tokens or 0
+                info = self._active_model_info()
+                if info is not None:
+                    p = info.pricing
+                    self._session_cost += (
+                        (usage.prompt_tokens or 0) / 1_000_000 * (p.input or 0)
+                        + (usage.completion_tokens or 0) / 1_000_000 * (p.output or 0)
+                    )
+            self._update_status_bar()
             self._finish_turn()
 
         def _turn_error(self, exc: Exception) -> None:

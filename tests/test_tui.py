@@ -19,7 +19,7 @@ import respx
 from rickshaw.memory.embedder import TFIDFEmbedder
 from rickshaw.memory.service import MemoryService
 from rickshaw.orchestrator import Orchestrator
-from rickshaw.config import ProviderProfile, RickshawConfig
+from rickshaw.config import ProviderProfile, RickshawConfig, _parse_status_bar, load_config
 from rickshaw.providers.base import (
     Capabilities,
     Effort,
@@ -30,6 +30,7 @@ from rickshaw.providers.base import (
 )
 
 import rickshaw.tui as tui
+from rickshaw.settings import load_settings, save_settings
 
 
 class _FakeProvider(LLMProvider):
@@ -314,6 +315,55 @@ def test_make_app_builds_instance():
     # Effort is applied to the orchestrator at construction.
     assert orch.effort == Effort.HIGH
     assert app is not None
+
+
+@pytest.mark.asyncio
+async def test_status_bar_default_shows_all_six_segments_in_order():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=RickshawConfig())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert str(app.query_one("#statusbar").render()) == (
+            "fake | fake-model | medium | \u2014 | 0 tok | \u2014"
+        )
+
+
+@pytest.mark.asyncio
+async def test_status_bar_custom_order_and_removal():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig(status_bar=["effort", "provider"])
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert str(app.query_one("#statusbar").render()) == "medium | fake"
+
+
+@pytest.mark.asyncio
+async def test_status_bar_context_dash_when_window_missing():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=RickshawConfig())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._active_model_info() is None
+        assert "\u2014" in str(app.query_one("#statusbar").render())
+
+
+def test_load_config_status_bar_custom_and_unknown_ignored(caplog):
+    s = load_settings()
+    s["status_bar"] = ["price", "provider", "bogus"]
+    save_settings(s)
+    cfg = load_config()
+    assert cfg.status_bar == ["price", "provider"]
+
+    with caplog.at_level("WARNING", logger="rickshaw.config"):
+        assert _parse_status_bar(["provider", "bogus"]) == ["provider"]
+    assert any("bogus" in msg for msg in caplog.messages)
 
 
 @pytest.mark.asyncio

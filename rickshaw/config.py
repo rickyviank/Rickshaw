@@ -12,6 +12,7 @@ API keys are **always** read from the environment (via each profile's
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +23,28 @@ from dotenv import load_dotenv
 
 from rickshaw.providers.base import Effort
 
+logger = logging.getLogger(__name__)
+
 _EFFORT_NAMES = {e.value: e for e in Effort}
+STATUS_BAR_SEGMENTS = ("provider", "model", "effort", "context", "tokens", "price")
+_DEFAULT_STATUS_BAR = list(STATUS_BAR_SEGMENTS)
+
+
+def _parse_status_bar(raw: object) -> list[str]:
+    """Return a validated status-bar segment list from a raw settings value.
+
+    Unknown/invalid segment names are ignored with a warning. Falls back to the
+    default order when *raw* is not a list.
+    """
+    if not isinstance(raw, list):
+        return list(_DEFAULT_STATUS_BAR)
+    out: list[str] = []
+    for seg in raw:
+        if isinstance(seg, str) and seg in STATUS_BAR_SEGMENTS:
+            out.append(seg)
+        else:
+            logger.warning("Ignoring unknown status_bar segment %r", seg)
+    return out
 
 
 @dataclass
@@ -115,6 +137,9 @@ class RickshawConfig:
     # Path to the user settings file (populated by load_config)
     settings_path: str | None = None
 
+    # Ordered status-bar segments (subset of STATUS_BAR_SEGMENTS)
+    status_bar: list[str] = field(default_factory=lambda: list(_DEFAULT_STATUS_BAR))
+
     # Extra overrides loaded from the config file
     extra: dict[str, str] = field(default_factory=dict)
 
@@ -202,6 +227,7 @@ def load_config(
     settings_effort = settings.get("effort", "")
     settings_emb_provider = settings.get("embedding_provider", "")
     settings_emb_model = settings.get("embedding_model", "")
+    status_bar = _parse_status_bar(settings.get("status_bar"))
 
     provider_name = _get(
         "RICKSHAW_PROVIDER",
@@ -253,6 +279,7 @@ def load_config(
         embedding_provider=embedding_provider,
         providers=providers,
         settings_path=settings_path,
+        status_bar=status_bar,
         extra={
             k: v
             for k, v in file_values.items()
