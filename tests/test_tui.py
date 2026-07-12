@@ -18,9 +18,10 @@ import pytest
 import respx
 
 from rickshaw.memory.embedder import TFIDFEmbedder
+from rickshaw.history import append_history, default_history_path, load_history
 from rickshaw.memory.service import MemoryService
 from rickshaw.orchestrator import Orchestrator
-from rickshaw.config import ProviderProfile, RickshawConfig
+from rickshaw.config import ProviderProfile, RickshawConfig, _parse_status_bar, load_config
 from rickshaw.providers.base import (
     Capabilities,
     Effort,
@@ -31,6 +32,7 @@ from rickshaw.providers.base import (
 )
 
 import rickshaw.tui as tui
+from rickshaw.settings import load_settings, save_settings
 
 
 class _FakeProvider(LLMProvider):
@@ -83,11 +85,46 @@ class _FakeProvider(LLMProvider):
         )
 
 
+class _GatedProvider(_FakeProvider):
+    """Fake provider whose stream blocks until released — lets tests observe
+    the in-flight 'thinking' state deterministically."""
+
+    def __init__(self) -> None:
+        super().__init__(function_calling=False)
+        import threading
+
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def stream(self, messages, effort=Effort.MEDIUM, tools=None, **kwargs):
+        self.started.set()
+        self.release.wait(5)
+        for chunk in ("Hello ", "from ", "fake"):
+            yield chunk
+
+
 def _make_orchestrator(function_calling: bool = False):
     provider = _FakeProvider(function_calling=function_calling)
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     orch = Orchestrator(provider=provider, memory=memory)
     return orch, provider, memory
+
+
+def _statusbar_text(app) -> str:
+    return str(app.query_one("#statusbar").render())
+
+
+def _fake_model_info():
+    return SimpleNamespace(
+        id="fake",
+        models=[
+            SimpleNamespace(
+                model="fake-model",
+                context_window=1000,
+                pricing=SimpleNamespace(input=1.0, output=2.0),
+            )
+        ],
+    )
 
 
 # --- module / wiring tests (no Textual needed) -------------------------------
@@ -395,6 +432,267 @@ def test_make_app_builds_instance():
 
 
 @pytest.mark.asyncio
+async def test_status_bar_default_shows_all_six_segments_in_order():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=RickshawConfig())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert str(app.query_one("#statusbar").render()) == (
+            "fake | fake-model | medium | — | 0 tok | —"
+        )
+
+
+@pytest.mark.asyncio
+async def test_status_bar_custom_order_and_removal():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig(status_bar=["effort", "provider"])
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert str(app.query_one("#statusbar").render()) == "medium | fake"
+
+
+@pytest.mark.asyncio
+async def test_status_bar_context_dash_when_window_missing():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=RickshawConfig())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._active_model_info() is None
+        assert "—" in str(app.query_one("#statusbar").render())
+
+
+def test_load_config_status_bar_custom_and_unknown_ignored(caplog):
+    s = load_settings()
+    s["status_bar"] = ["price", "provider", "bogus"]
+    save_settings(s)
+    cfg = load_config()
+    assert cfg.status_bar == ["price", "provider"]
+
+    with caplog.at_level("WARNING", logger="rickshaw.config"):
+        assert _parse_status_bar(["provider", "bogus"]) == ["provider"]
+    assert any("bogus" in msg for msg in caplog.messages)
+
+
+@pytest.mark.asyncio
+async def test_app_statusbar_drops_lower_priority_segments_on_narrow_width():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._find_model_info", return_value=_fake_model_info()):
+        async with app.run_test(size=(40, 24)) as pilot:
+            await pilot.pause()
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "$" not in rendered
+            assert "0%" in rendered
+            assert rendered.startswith("fake")
+
+
+@pytest.mark.asyncio
+async def test_app_statusbar_drops_context_and_tokens_at_extreme_narrow_width():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._find_model_info", return_value=_fake_model_info()):
+        async with app.run_test(size=(30, 24)) as pilot:
+            await pilot.pause()
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "$" not in rendered
+            assert "0%" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_statusbar_restores_segments_on_resize():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._find_model_info", return_value=_fake_model_info()):
+        async with app.run_test(size=(200, 24)) as pilot:
+            await pilot.pause()
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "0%" in rendered
+            assert "$0.0000" in rendered
+
+            await pilot.resize_terminal(30, 24)
+            rendered = _statusbar_text(app)
+            assert "fake" in rendered
+            assert "fake-model" in rendered
+            assert "medium" in rendered
+            assert "0%" not in rendered
+            assert "$" not in rendered
+
+            await pilot.resize_terminal(200, 24)
+            rendered = _statusbar_text(app)
+            assert "0%" in rendered
+            assert "$0.0000" in rendered
+
+async def test_app_slash_opens_command_menu():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/"
+        await pilot.pause()
+        menu = app.query_one("#slashmenu")
+        rendered = str(menu.render())
+        assert menu.display is True
+        assert "/help" in rendered
+        assert "/model" in rendered
+        assert "/effort" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_slash_filters_command_menu():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/mo"
+        await pilot.pause()
+        menu = app.query_one("#slashmenu")
+        rendered = str(menu.render())
+        assert menu.display is True
+        assert "/model" in rendered
+        assert "/models" in rendered
+        assert "/help" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_slash_effort_value_picker_applies_selection():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    orch.effort = Effort.LOW
+    app = tui.make_app(orch, provider, Effort.LOW)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/effort "
+        await pilot.pause()
+        menu = app.query_one("#slashmenu")
+        rendered = str(menu.render())
+        assert menu.display is True
+        assert "low" in rendered
+        assert "medium" in rendered
+        assert "high" in rendered
+
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert orch.effort == Effort.MEDIUM
+        assert app.query_one("#slashmenu").display is False
+
+
+@pytest.mark.asyncio
+async def test_app_slash_escape_dismisses_menu():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/"
+        await pilot.pause()
+        assert app.query_one("#slashmenu").display is True
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.query_one("#slashmenu").display is False
+
+
+@pytest.mark.asyncio
+async def test_app_slash_tab_completes_arg_command_to_value_picker():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/ef"
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        prompt = app.query_one("#prompt")
+        menu = app.query_one("#slashmenu")
+        rendered = str(menu.render())
+        assert prompt.value == "/effort "
+        assert menu.display is True
+        assert "low" in rendered
+        assert "medium" in rendered
+        assert "high" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_records_plain_messages_and_slash_commands_in_history():
+    pytest.importorskip("textual")
+    orch, provider, memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "remember milk"
+        await pilot.press("enter")
+
+        stored = False
+        for _ in range(60):
+            if any("Hello from fake" in r.text for r in memory.store.all_records()):
+                stored = True
+                break
+            await pilot.pause(0.05)
+        assert stored
+        for _ in range(60):
+            if not app._turn_active:
+                break
+            await pilot.pause(0.05)
+
+        prompt = app.query_one("#prompt")
+        prompt.value = "/help"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert load_history(default_history_path()) == ["remember milk", "/help"]
+
+
+def test_app_loads_persisted_history_on_construction():
+    pytest.importorskip("textual")
+    append_history("first message")
+    append_history("/help")
+    orch, provider, _memory = _make_orchestrator()
+
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    assert app._history == ["first message", "/help"]
+    assert app._history_pos == 2
+
+
+def test_history_cap_rolls_over_at_1000_entries():
+    entries = [f"entry {i}" for i in range(1005)]
+    for entry in entries:
+        append_history(entry)
+
+    history = load_history()
+    assert len(history) == 1000
+    assert history[0] == "entry 5"
+    assert history[-1] == "entry 1004"
+
+
+@pytest.mark.asyncio
 async def test_app_runs_a_turn_through_orchestrator():
     pytest.importorskip("textual")
     orch, provider, memory = _make_orchestrator(function_calling=False)
@@ -418,6 +716,182 @@ async def test_app_runs_a_turn_through_orchestrator():
         assert "remember milk" in rendered
         # The streamed assistant reply was routed through run_turn into memory.
         assert stored
+
+
+@pytest.mark.asyncio
+async def test_prompt_newline_via_ctrl_j():
+    pytest.importorskip("textual")
+    orch, provider, memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.focus()
+        await pilot.press("f", "o", "o")
+        await pilot.press("ctrl+j")
+        await pilot.press("b", "a", "r")
+        await pilot.pause()
+
+        assert app.query_one("#prompt").text == "foo\nbar"
+        assert not any("Hello from fake" in r.text for r in memory.store.all_records())
+
+
+@pytest.mark.asyncio
+async def test_prompt_newline_via_shift_enter():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.focus()
+        await pilot.press("f", "o", "o")
+        await pilot.press("shift+enter")
+        await pilot.press("b", "a", "r")
+        await pilot.pause()
+
+        assert app.query_one("#prompt").text == "foo\nbar"
+
+
+@pytest.mark.asyncio
+async def test_prompt_enter_submits_and_clears():
+    pytest.importorskip("textual")
+    orch, provider, memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.focus()
+        await pilot.press("h", "i")
+        await pilot.press("enter")
+
+        stored = False
+        for _ in range(60):
+            if any("Hello from fake" in r.text for r in memory.store.all_records()):
+                stored = True
+                break
+            await pilot.pause(0.05)
+
+        transcript = app.query_one("#transcript").query("Static")
+        rendered = " ".join(str(w.render()) for w in transcript)
+        assert "hi" in rendered
+        assert stored
+        assert app.query_one("#prompt").text == ""
+
+
+@pytest.mark.asyncio
+async def test_prompt_esc_clears_when_idle():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.focus()
+        await pilot.press("x", "y", "z")
+        assert app.query_one("#prompt").text == "xyz"
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.query_one("#prompt").text == ""
+
+
+@pytest.mark.asyncio
+async def test_wizard_advances_on_textarea():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/settings"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = " ".join(
+                str(w.render())
+                for w in app.query_one("#transcript").query("Static")
+            )
+            assert "Pick a provider" in rendered
+
+            app.query_one("#prompt").value = "fake"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = " ".join(
+                str(w.render())
+                for w in app.query_one("#transcript").query("Static")
+            )
+            assert "Pick a model" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_mounts_welcome_panel():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test():
+        welcome = app.query_one("#welcome")
+        rendered = str(welcome.render())
+        assert "o--o  rickshaw" in rendered
+        assert "your driver, your memory" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_no_provider_welcome_shows_none():
+    pytest.importorskip("textual")
+    orch, _provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    app = tui.make_app(orch, None, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test():
+        welcome = app.query_one("#welcome")
+        rendered = str(welcome.render())
+        assert "provider: (none)" in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_clear_re_renders_welcome_panel():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        original = app.query_one("#welcome")
+        app.query_one("#prompt").value = "/clear"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        refreshed = app.query_one("#welcome")
+        assert refreshed is not original
+        rendered = " ".join(
+            str(w.render()) for w in app.query_one("#transcript").query("Static")
+        )
+        assert "cleared." in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_boot_smoke_mounts_core_widgets():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#welcome")
+        app.query_one("#prompt")
+        app.query_one("#statusbar")
+
+        app.query_one("#prompt").value = "/help"
+        await pilot.press("enter")
+        await pilot.pause()
+        rendered = " ".join(
+            str(w.render()) for w in app.query_one("#transcript").query("Static")
+        )
+        assert "/help" in rendered
 
 
 @pytest.mark.asyncio
@@ -450,6 +924,188 @@ async def test_app_degraded_turn_shows_themed_banner():
             await pilot.pause(0.05)
 
         assert banner_found
+
+
+@pytest.mark.asyncio
+async def test_j4_indicator_appears_on_turn_start():
+    pytest.importorskip("textual")
+    provider = _GatedProvider()
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+        for _ in range(100):
+            if provider.started.is_set():
+                break
+            await pilot.pause(0.02)
+
+        indicator = app.query("#turn-indicator")
+        assert len(indicator) > 0
+        assert "Thinking" in str(app.query_one("#turn-indicator").render())
+
+        provider.release.set()
+        for _ in range(200):
+            if len(app.query("#turn-indicator")) == 0:
+                break
+            await pilot.pause(0.02)
+
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static, Markdown")
+        )
+        assert "o--o" in rendered
+        assert "rickshaw" in rendered
+
+
+@pytest.mark.asyncio
+async def test_j4_role_glyphs_present():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hello"
+        await pilot.press("enter")
+        for _ in range(100):
+            if any("Hello from fake" in r.text for r in _memory.store.all_records()):
+                break
+            await pilot.pause(0.02)
+
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static, Markdown")
+        )
+        assert "o--o" in rendered
+        assert "rickshaw" in rendered
+        assert "Hello from fake" in rendered
+
+
+@pytest.mark.asyncio
+async def test_j4_esc_interrupts_running_turn():
+    pytest.importorskip("textual")
+    provider = _GatedProvider()
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+        for _ in range(100):
+            if provider.started.is_set():
+                break
+            await pilot.pause(0.02)
+
+        await pilot.press("escape")
+        await pilot.pause(0.05)
+
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static, Markdown")
+        )
+        assert "(interrupted)" in rendered
+        assert len(app.query("#turn-indicator")) == 0
+        assert app.query_one("#prompt").disabled is False
+
+        provider.release.set()
+        for _ in range(100):
+            await pilot.pause(0.02)
+            if app.query_one("#prompt").disabled is False:
+                break
+
+
+@pytest.mark.asyncio
+async def test_j4_ctrl_c_single_press_cancels_running_turn():
+    pytest.importorskip("textual")
+    provider = _GatedProvider()
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+        for _ in range(100):
+            if provider.started.is_set():
+                break
+            await pilot.pause(0.02)
+
+        with patch.object(app, "exit") as mock_exit:
+            await pilot.press("ctrl+c")
+            await pilot.pause(0.05)
+            assert mock_exit.called is False
+
+        rendered = " ".join(
+            str(w.render())
+            for w in app.query_one("#transcript").query("Static, Markdown")
+        )
+        assert "(interrupted)" in rendered
+
+        provider.release.set()
+        for _ in range(100):
+            await pilot.pause(0.02)
+            if app.query_one("#prompt").disabled is False:
+                break
+
+
+@pytest.mark.asyncio
+async def test_j4_ctrl_c_double_tap_quits():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        with patch.object(app, "exit") as mock_exit:
+            await pilot.press("ctrl+c")
+            await pilot.pause(0.05)
+            assert mock_exit.called is False
+            assert "again to quit" in str(app.query_one("#hint").render())
+
+            await pilot.press("ctrl+c")
+            await pilot.pause(0.05)
+            assert mock_exit.called is True
+
+async def test_app_history_recall_and_return_to_draft():
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "recall this"
+        await pilot.press("enter")
+
+        for _ in range(60):
+            if not app._turn_active:
+                break
+            await pilot.pause(0.05)
+
+        await pilot.press("up")
+        assert app.query_one("#prompt").value == "recall this"
+
+        await pilot.press("down")
+        assert app.query_one("#prompt").value == ""
+
+
+@pytest.mark.asyncio
+async def test_app_history_navigation_is_blocked_during_wizard():
+    pytest.importorskip("textual")
+    append_history("saved history entry")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app._settings_state = {"step": "provider", "providers": ["fake"], "on_launch": False}
+        prompt = app.query_one("#prompt")
+        prompt.value = "draft"
+        prompt.focus()
+
+        await pilot.press("up")
+
+        assert app.query_one("#prompt").value == "draft"
 
 
 @pytest.mark.asyncio

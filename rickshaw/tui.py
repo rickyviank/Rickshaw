@@ -28,20 +28,21 @@ import argparse
 import logging
 import os
 import sys
+import time
 import webbrowser
 from urllib.parse import quote, urlencode
 
 import httpx
 
 from rickshaw.cli import _EFFORT_NAMES, _build_provider, load_config
-
-logger = logging.getLogger(__name__)
 from rickshaw.config import ProviderProfile, RickshawConfig
 from rickshaw.memory.service import MemoryService
+from rickshaw.history import append_history, load_history
 from rickshaw.orchestrator import Orchestrator
 from rickshaw.providers.base import Effort, LLMProvider
 from rickshaw.providers.build import build_provider_from_profile
 from rickshaw.providers.factory import get_provider
+from rickshaw.prompt.builder import _estimate_tokens
 from rickshaw.settings import load_settings, save_settings
 
 from rickshaw_ai._builtins import default_providers as _builtin_providers
@@ -49,6 +50,8 @@ from rickshaw_ai.credentials.store import FileCredentialStore
 from rickshaw_ai.factory import builtin_models as _builtin_models
 from rickshaw.providers import _bridge
 from rickshaw.providers._bridge import run_sync
+
+logger = logging.getLogger(__name__)
 
 # Branding — module-level so cli.py can import and reuse them.
 RICKSHAW_LOGO = "o--o  rickshaw"
@@ -86,14 +89,27 @@ _COMMANDS = {
     "/quit": "Exit.",
     "/exit": "Exit.",
 }
+_ARG_COMMANDS = {"/effort", "/model"}
+_EFFORT_VALUES = ["low", "medium", "high"]
+
+STATUS_BAR_VOCABULARY = ("provider", "model", "effort", "context", "tokens", "price")
+STATUS_BAR_DEFAULT_SEGMENTS = [
+    "provider",
+    "model",
+    "effort",
+    "context",
+    "tokens",
+    "price",
+]
+STATUS_BAR_KEEP_ALWAYS = {"provider", "model", "effort"}
+STATUS_BAR_DROP_ORDER = ("price", "tokens", "context")
+STATUS_BAR_NARROW_WIDTH = 80
 
 _DEFAULT_HINT = "/help  ·  esc interrupt  ·  ^c quit"
-_USER_MARK = "[#d98a3d]\u203a[/]"  # amber angle-quote before each user message
-
-#: Fixed vocabulary of status-bar segments (PRD D7/D9; shared J6/J8 convention).
-_STATUS_SEGMENTS = ("provider", "model", "effort", "context", "tokens", "price")
-#: Placeholder rendered for any segment whose data is missing (C8, PRD J7).
-_MISSING_SEGMENT = "\u2014"  # em dash
+_USER_MARK = "[#e0a86b]›[/]"  # amber angle-quote before each user message
+_PROMPT_GLYPH = "›"
+_ASSISTANT_LABEL = "o--o [dim]rickshaw[/]"
+_SPINNER_FRAMES = "|/-\\"
 
 
 def _status_segment_value(
@@ -108,51 +124,35 @@ def _status_segment_value(
     session_cost: float | None = None,
     warnings: list[str] | None = None,
 ) -> str:
-    """Compute a single status-bar segment's display value.
-
-    Returns the em-dash placeholder (``\u2014``) for any segment whose data is
-    missing or unavailable, and never raises (C8). ``context`` needs the active
-    model's ``context_window`` (from ``rickshaw_ai`` ``ModelInfo``); ``price``
-    needs its ``pricing`` defaults. When *warnings* is a list, a short
-    human-readable reason is appended (de-duplicated) for each missing-metadata
-    segment so callers can surface a themed warning (PRD J7 step 2).
-
-    Shared by the status-bar journeys (J6/J8); J7 owns the missing-data path.
-    """
-
     def _warn(msg: str) -> None:
         if warnings is not None and msg not in warnings:
             warnings.append(msg)
 
     if name == "provider":
-        return provider or _MISSING_SEGMENT
+        return provider or "—"
     if name == "model":
-        return model or _MISSING_SEGMENT
+        return model or "—"
     if name == "effort":
-        return effort or _MISSING_SEGMENT
+        return effort or "—"
     if name == "context":
         window = getattr(model_info, "context_window", 0) or 0
         if window <= 0:
             _warn("context window unknown for the active model")
-            return _MISSING_SEGMENT
+            return "—"
         pct = round(100 * max(context_tokens, 0) / window)
         return f"{pct}%"
     if name == "tokens":
-        if session_tokens is None:
-            return _MISSING_SEGMENT
-        return f"{session_tokens} tok"
+        return "—" if session_tokens is None else f"{session_tokens} tok"
     if name == "price":
         pricing = getattr(model_info, "pricing", None)
         in_rate = getattr(pricing, "input", 0.0) or 0.0
         out_rate = getattr(pricing, "output", 0.0) or 0.0
         if in_rate <= 0 and out_rate <= 0:
             _warn("pricing unknown for the active model")
-            return _MISSING_SEGMENT
+            return "—"
         return f"${(session_cost or 0.0):.4f}"
-    # Unknown segment name — ignore with a warning (PRD D9/J8).
     _warn(f"unknown status-bar segment: {name!r}")
-    return _MISSING_SEGMENT
-
+    return "—"
 
 _TEXTUAL_MISSING_MSG = (
     "The Rickshaw terminal UI requires Textual, which is not installed.\n"
@@ -247,6 +247,16 @@ def _builtin_provider_info(provider_id: str):
     return None
 
 
+def _find_model_info(provider_id: str, model: str):
+    """Return the ModelInfo for provider_id/model from the builtins, or None."""
+    for p in _builtin_providers():
+        if p.id == provider_id:
+            for m in p.models:
+                if m.model == model:
+                    return m
+    return None
+
+
 def _oauth_quirk(provider_id: str) -> dict[str, object]:
     quirk = dict(_DEFAULT_OAUTH_QUIRK)
     quirk.update(_OAUTH_QUIRKS.get(provider_id, {}))
@@ -312,9 +322,11 @@ def make_app(
         from textual import work
         from textual.app import App, ComposeResult
         from textual.binding import Binding
-        from textual.containers import VerticalScroll
+        from textual.css.query import NoMatches
+        from textual.containers import Horizontal, VerticalScroll
+        from textual.message import Message
         from textual.suggester import SuggestFromList
-        from textual.widgets import Input, Markdown, Rule, Static
+        from textual.widgets import Markdown, Rule, Static, TextArea
     except ImportError as exc:  # pragma: no cover - exercised via message text
         raise SystemExit(_TEXTUAL_MISSING_MSG) from exc
 
@@ -331,6 +343,34 @@ def make_app(
 
     # ---- Main TUI app --------------------------------------------------
 
+    class PromptArea(TextArea):
+        """Multi-line prompt. Enter submits; Shift+Enter / Ctrl+J insert a newline."""
+
+        class Submitted(Message):
+            def __init__(self, value: str) -> None:
+                self.value = value
+                super().__init__()
+
+        @property
+        def value(self) -> str:
+            return self.text
+
+        @value.setter
+        def value(self, new: str) -> None:
+            self.text = new
+
+        def _on_key(self, event) -> None:
+            if event.key == "enter":
+                event.prevent_default()
+                event.stop()
+                self.post_message(self.Submitted(self.text))
+                return
+            if event.key in ("shift+enter", "ctrl+j"):
+                event.prevent_default()
+                event.stop()
+                self.insert("\n")
+                return
+
     class RickshawTUI(App):
         """Textual application driving turns through the Orchestrator."""
 
@@ -340,49 +380,104 @@ def make_app(
         # Near-monochrome with a single amber accent; hairline rules separate
         # turns. Chrome is intentionally almost invisible.
         CSS = """
-        $rk-warn: #d98a3d;
-        $rk-error: #d16a5a;
-        Screen { layout: vertical; background: #0e0f11; }
-        #head { height: auto; color: #4b5563; padding: 1 3 0 3; }
-        #transcript {
-            height: 1fr;
-            padding: 1 3;
-            scrollbar-size: 1 1;
-            scrollbar-color: #2a2e37;
-            scrollbar-color-hover: #3a3f47;
-            scrollbar-color-active: #3a3f47;
-            scrollbar-background: #0e0f11;
-        }
-        #transcript > Static { margin: 0 0 1 0; }
-        #transcript > Markdown {
-            margin: 0 0 1 0;
-            padding: 0;
-            background: transparent;
-        }
-        #transcript > Rule { color: #22252b; margin: 0 0 1 0; }
-        .u { color: #dfe2e7; }
-        .a { color: #9aa0a8; }
-        .meta { color: #5c6370; }
-        .warn { color: $rk-warn; }
-        .degraded-banner {
-            color: $rk-error;
-            text-style: bold;
-            padding: 0 1;
-        }
-        #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
-        #prompt {
-            border: none;
-            background: #0e0f11;
-            color: #dfe2e7;
-            padding: 0 3;
-        }
-        #prompt:focus { border: none; }
+          $rk-bg: #0f1113;
+          $rk-surface: #16181b;
+          $rk-border: #2a2f36;
+          $rk-text: #e6e8ea;
+          $rk-meta: #8b929c;
+          $rk-accent: #e0a86b;
+          $rk-assistant: #7fb0c9;
+          $rk-warn: #d98a3d;
+          $rk-error: #d16a5a;
+          $rk-success: #7fae7f;
+
+          Screen { layout: vertical; background: $rk-bg; }
+          #welcome {
+              height: auto;
+              width: 1fr;
+              background: $rk-surface;
+              color: $rk-text;
+              border: round $rk-border;
+              padding: 0 2;
+              margin: 0 0 1 0;
+          }
+          #welcome.compact { padding: 0 1; }
+          #transcript {
+              height: 1fr;
+              padding: 1 3;
+              scrollbar-size: 1 1;
+              scrollbar-color: #2a2e37;
+              scrollbar-color-hover: #3a3f47;
+              scrollbar-color-active: #3a3f47;
+              scrollbar-background: $rk-bg;
+          }
+          #transcript > Static { margin: 0 0 1 0; }
+          #transcript > Markdown {
+              margin: 0 0 1 0;
+              padding: 0;
+              background: transparent;
+          }
+          #transcript > Rule { color: $rk-border; margin: 0 0 1 0; }
+          #transcript > Markdown.assistant { padding: 0 0 0 2; }
+          .u { color: $rk-text; }
+          .a { color: $rk-meta; }
+          .a-label { color: $rk-assistant; }
+          .meta { color: $rk-meta; }
+          .warn { color: $rk-warn; }
+          #turn-indicator { color: $rk-meta; height: auto; }
+          .degraded-banner {
+              color: #1a1a1a;
+              background: $rk-error;
+              text-style: bold;
+              padding: 0 1;
+          }
+          #hint { height: 1; color: #3a3f47; padding: 0 3 1 3; }
+          #slashmenu {
+              display: none;
+              background: $rk-surface;
+              color: $rk-meta;
+              border: round $rk-border;
+              padding: 0 1;
+              margin: 0 3;
+              height: auto;
+          }
+          #prompt-box {
+              height: auto;
+              max-height: 12;
+              margin: 0 3 1 3;
+              padding: 0 1;
+              border: round $rk-border;
+              background: transparent;
+          }
+          #prompt-box:focus-within { border: round $rk-accent; }
+          #prompt-glyph {
+              width: 2;
+              height: auto;
+              color: $rk-accent;
+              padding: 0;
+          }
+          #prompt {
+              height: auto;
+              max-height: 10;
+              border: none;
+              padding: 0;
+              background: transparent;
+              color: $rk-text;
+          }
+          #prompt:focus { border: none; }
+          #statusbar {
+              dock: bottom;
+              height: 1;
+              background: $rk-surface;
+              color: $rk-meta;
+              padding: 0 3;
+          }
         """
 
         BINDINGS = [
             Binding("escape", "interrupt", "Interrupt", show=False),
             Binding("ctrl+l", "clear", "Clear", show=False),
-            Binding("ctrl+c", "quit", "Quit", show=False),
+            Binding("ctrl+c", "ctrl_c", "Quit", show=False, priority=True),
         ]
 
         def __init__(self) -> None:
@@ -392,6 +487,8 @@ def make_app(
             self.effort = effort
             self.cfg = cfg
             self.orchestrator.effort = effort
+            self._history: list[str] = load_history()
+            self._history_pos: int = len(self._history)
             self._buffer = ""
             self._current_md: Markdown | None = None
             self._turn_active = False
@@ -399,20 +496,40 @@ def make_app(
             self._provider_add_state: dict | None = None
             self._settings_state: dict | None = None
             self._login_state: dict | None = None
+            self._turn_seq = 0
+            self._indicator: Static | None = None
+            self._indicator_timer = None
+            self._turn_started = 0.0
+            self._spinner_idx = 0
+            self._live_tokens = 0
+            self._first_token = False
+            self._ctrl_c_pending = False
+            self._ctrl_c_timer = None
+            self._session_tokens = 0
+            self._session_tool_calls = 0
+            self._session_cost = 0.0
+            self._last_ctx_tokens = 0
+            self._ctx_window_warned = False
+            self._last_usage = None
+            self._menu_open = False
+            self._menu_mode = "command"
+            self._menu_items: list[tuple[str, str]] = []
+            self._menu_index = 0
+            self._menu_arg_cmd = ""
 
         # ---- layout -----------------------------------------------------
 
         def compose(self) -> ComposeResult:
-            yield Static(RICKSHAW_BANNER, id="head")
             yield VerticalScroll(id="transcript")
+            yield Static("", id="slashmenu")
             yield Static(_DEFAULT_HINT, id="hint")
-            yield Input(
-                placeholder="Message rickshaw…",
-                id="prompt",
-                suggester=SuggestFromList(sorted(_COMMANDS), case_sensitive=False),
-            )
+            with Horizontal(id="prompt-box"):
+                yield Static(_PROMPT_GLYPH, id="prompt-glyph")
+                yield PromptArea(id="prompt")
+            yield Static("", id="statusbar")
 
         def on_mount(self) -> None:
+            self._render_welcome()
             if self.provider is None:
                 self._write("no provider selected", cls="meta")
                 self._start_provider_picker()
@@ -429,12 +546,65 @@ def make_app(
                         "tools off — recall is harness-driven for this provider.",
                         cls="meta",
                     )
-            self.query_one("#prompt", Input).focus()
+            self.query_one("#prompt", PromptArea).focus()
+            self._update_status_bar()
+
+        # ---- welcome panel ----------------------------------------------
+
+        def _welcome_text(self, compact: bool) -> str:
+            """Rich-markup body for the welcome panel (D2)."""
+            logo = f"[$rk-assistant]{RICKSHAW_LOGO}[/]"
+            if self.provider is None:
+                prov = "provider: (none)"
+                prov_markup = f"[$rk-meta]{prov}[/]"
+            else:
+                model = getattr(self.provider, "_model", "") or self.provider.name
+                prov = (
+                    f"{self.provider.name} \u00b7 {model} \u00b7 effort "
+                    f"{self.orchestrator.effort.value}"
+                )
+                prov_markup = f"[$rk-accent]{prov}[/]"
+            if compact:
+                return (
+                    f"{logo}  [$rk-meta]\u00b7 {RICKSHAW_SLOGAN}[/]\n"
+                    f"{prov_markup}  [$rk-meta]\u00b7  /help[/]"
+                )
+            cwd = os.getcwd()
+            return (
+                f"{logo}\n"
+                f"[$rk-meta]{RICKSHAW_SLOGAN}[/]\n"
+                f"\n"
+                f"{prov_markup}\n"
+                f"[$rk-meta]cwd:[/] {cwd}\n"
+                f"\n"
+                f"[$rk-meta]/help  \u00b7  esc interrupt  \u00b7  ^c quit[/]"
+            )
+
+        def _render_welcome(self) -> None:
+            """Mount the welcome panel at the top of the transcript (launch/clear)."""
+            width = self.size.width
+            compact = bool(width) and width < 80
+            panel = Static(self._welcome_text(compact=compact), id="welcome")
+            self.query_one("#transcript", VerticalScroll).mount(panel)
+            self._scroll_end()
+
+        def _apply_responsive_welcome(self, width: int | None = None) -> None:
+            try:
+                welcome = self.query_one("#welcome", Static)
+            except NoMatches:
+                return
+            width = width if width is not None else self.size.width
+            welcome.update(self._welcome_text(compact=bool(width) and width < 80))
+
+        def on_resize(self, event) -> None:
+            self._update_status_bar(event.size.width)
+            self._apply_responsive_welcome(event.size.width)
 
         # ---- on-launch provider picker ---------------------------------
 
         def _start_provider_picker(self) -> None:
             """Display the provider picker (builtins + configured)."""
+            self._close_menu()
             builtin_names = _get_builtin_provider_names()
             configured_names = sorted(self.cfg.providers)
             all_names = sorted(set(builtin_names) | set(configured_names))
@@ -469,8 +639,15 @@ def make_app(
 
         def _begin_assistant(self) -> None:
             self._buffer = ""
-            md = Markdown("")
-            self.query_one("#transcript", VerticalScroll).mount(md)
+            transcript = self.query_one("#transcript", VerticalScroll)
+            label = Static(_ASSISTANT_LABEL, classes="a-label")
+            md = Markdown("", classes="assistant")
+            if self._indicator is not None and self._indicator.parent is not None:
+                transcript.mount(label, before=self._indicator)
+                transcript.mount(md, before=self._indicator)
+            else:
+                transcript.mount(label)
+                transcript.mount(md)
             self._current_md = md
             self._scroll_end()
 
@@ -480,24 +657,246 @@ def make_app(
         def _set_hint(self, text: str) -> None:
             self.query_one("#hint", Static).update(text)
 
+        # ---- status bar ----------------------------------------------
+
+        def _active_model_info(self):
+            """Return the active model info (or provider wrapper) if available."""
+            if self.provider is None:
+                return None
+            model = getattr(self.provider, "_model", "") or ""
+            info = _find_model_info(self.provider.name, model)
+            if info is None:
+                return None
+            if hasattr(info, "context_window") or hasattr(info, "pricing"):
+                return info
+            models = getattr(info, "models", None) or []
+            for model_info in models:
+                if getattr(model_info, "model", None) == model or getattr(
+                    model_info, "id", None
+                ) == model:
+                    return model_info
+            return models[0] if models else info
+
+        def _context_segment(self) -> str:
+            info = self._active_model_info()
+            window = getattr(info, "context_window", 0) if info is not None else 0
+            if not window:
+                if not self._ctx_window_warned:
+                    logger.warning(
+                        "context_window unavailable for active model; rendering '—'"
+                    )
+                    self._ctx_window_warned = True
+                return "—"
+            pct = (self._last_ctx_tokens / window) * 100
+            return f"{pct:.0f}%"
+
+        def _price_segment(self) -> str:
+            info = self._active_model_info()
+            if info is None or not getattr(info, "pricing", None):
+                return "—"
+            return f"~${self._session_cost:.4f}"
+
+        def _status_segment(self, name: str) -> str:
+            info = self._active_model_info()
+            return _status_segment_value(
+                name,
+                provider=self.provider.name if self.provider else None,
+                model=getattr(self.provider, "_model", "") or (
+                    self.provider.name if self.provider else None
+                ),
+                effort=getattr(self.orchestrator.effort, "value", None),
+                model_info=info,
+                context_tokens=self._last_ctx_tokens,
+                session_tokens=self._session_tokens,
+                session_cost=self._session_cost,
+            )
+
+        def _update_status_bar(self, width: int | None = None) -> None:
+            try:
+                bar = self.query_one("#statusbar", Static)
+            except Exception:
+                return
+            segments = [s for s in (self.cfg.status_bar or []) if s in STATUS_BAR_VOCABULARY]
+            if not segments:
+                bar.update("")
+                return
+
+            width = width if width is not None else getattr(self.size, "width", 0) or 0
+            visible = list(segments)
+            if width > 0:
+                content_width = max(0, width - 2)
+                while True:
+                    text = " | ".join(self._status_segment(name) for name in visible)
+                    if len(text) <= content_width:
+                        break
+                    dropped = False
+                    for name in STATUS_BAR_DROP_ORDER:
+                        if name in visible and name not in STATUS_BAR_KEEP_ALWAYS:
+                            visible.remove(name)
+                            dropped = True
+                            break
+                    if not dropped:
+                        break
+            bar.update(" | ".join(self._status_segment(name) for name in visible))
+
         def _warn_missing_metadata(self, model_info: object | None) -> list[str]:
-            """Surface themed warnings for status-bar segments whose model
-            metadata is missing (context window / pricing), rendering ``—`` for
-            them rather than failing (C8, PRD J7 step 2). Returns the warnings
-            emitted so callers/tests can inspect them.
-            """
             warnings: list[str] = []
             for name in ("context", "price"):
                 _status_segment_value(name, model_info=model_info, warnings=warnings)
             for msg in warnings:
-                self._write(f"\u26a0 {msg}", "warn")
+                self._write(f"⚠ {msg}", "warn")
             return warnings
 
+        def _render_menu(self) -> None:
+            menu = self.query_one("#slashmenu", Static)
+            if not self._menu_open or not self._menu_items:
+                menu.update("")
+                return
+
+            from rich.markup import escape
+
+            lines: list[str] = []
+            items = self._menu_items
+            for idx, (value, desc) in enumerate(items):
+                value = escape(value)
+                desc = escape(desc)
+                if self._menu_mode == "command":
+                    body = f"{value:<10} {desc}"
+                else:
+                    body = value
+                if idx == self._menu_index:
+                    lines.append(f"[#e0a86b]›[/] [reverse #e0a86b]{body}[/]")
+                else:
+                    lines.append(f"[#8b929c]  {body}[/]")
+            menu.update("\n".join(lines))
+
+        def _open_menu(
+            self,
+            mode: str,
+            items: list[tuple[str, str]],
+            arg_cmd: str = "",
+        ) -> None:
+            self._menu_open = True
+            self._menu_mode = mode
+            self._menu_items = items
+            self._menu_arg_cmd = arg_cmd
+            if self._menu_items:
+                self._menu_index = min(self._menu_index, len(self._menu_items) - 1)
+            else:
+                self._menu_index = 0
+            self.query_one("#slashmenu", Static).display = True
+            self._render_menu()
+
+        def _close_menu(self) -> None:
+            self._menu_open = False
+            self._menu_mode = "command"
+            self._menu_items = []
+            self._menu_index = 0
+            self._menu_arg_cmd = ""
+            menu = self.query_one("#slashmenu", Static)
+            menu.update("")
+            menu.display = False
+
+        def _menu_accept(self, *, via_enter: bool) -> bool:
+            if not self._menu_open or not self._menu_items:
+                return False
+
+            if self._menu_mode == "value":
+                arg_cmd = self._menu_arg_cmd
+                sel = self._menu_items[self._menu_index][0]
+                self.query_one("#prompt", PromptArea).text = ""
+                self._close_menu()
+                if arg_cmd == "/effort":
+                    self._cmd_effort(sel)
+                elif arg_cmd == "/model":
+                    self._cmd_model(sel)
+                return True
+
+            typed = self.query_one("#prompt", PromptArea).text.strip().lower()
+            exact = typed in _COMMANDS
+            if via_enter and exact:
+                self._close_menu()
+                return False
+
+            cmd = self._menu_items[self._menu_index][0]
+            if cmd in _ARG_COMMANDS:
+                self.query_one("#prompt", PromptArea).text = f"{cmd} "
+                self._close_menu()
+                return True
+
+            self.query_one("#prompt", PromptArea).text = ""
+            self._close_menu()
+            self._handle_command(cmd)
+            return True
         # ---- input handling --------------------------------------------
 
-        def on_input_submitted(self, event: Input.Submitted) -> None:
+        def _update_menu_from_prompt(self, text: str) -> None:
+            if (
+                self._login_state is not None
+                or self._settings_state is not None
+                or self._provider_add_state is not None
+                or self._turn_active
+            ):
+                self._close_menu()
+                return
+
+            if not text.startswith("/"):
+                self._close_menu()
+                return
+
+            if " " in text:
+                cmd, _, rest = text.partition(" ")
+                cmd = cmd.lower()
+                if cmd in _ARG_COMMANDS:
+                    if cmd == "/effort":
+                        filter_text = rest.strip().lower()
+                        items = [
+                            (v, "") for v in _EFFORT_VALUES if v.startswith(filter_text)
+                        ]
+                    else:
+                        if self.provider is None:
+                            self._close_menu()
+                            return
+                        try:
+                            models = self.provider.available_models()
+                        except Exception:
+                            self._close_menu()
+                            return
+                        filter_text = rest.strip()
+                        items = [(m, "") for m in models if m.startswith(filter_text)]
+                    if not items:
+                        self._close_menu()
+                        return
+                    self._menu_index = 0
+                    self._open_menu("value", items, arg_cmd=cmd)
+                    return
+                self._close_menu()
+                return
+
+            items = [
+                (name, desc)
+                for name, desc in _COMMANDS.items()
+                if name.startswith(text.lower())
+            ]
+            if not items:
+                self._close_menu()
+                return
+            self._menu_index = 0
+            self._open_menu("command", items)
+
+        def on_text_area_changed(self, event: TextArea.Changed) -> None:
+            if getattr(event.text_area, "id", None) == "prompt":
+                self._update_menu_from_prompt(event.text_area.text)
+
+        def on_prompt_area_changed(self, event: TextArea.Changed) -> None:
+            self.on_text_area_changed(event)
+
+        def on_prompt_area_submitted(self, event: "PromptArea.Submitted") -> None:
             value = event.value.strip()
-            event.input.value = ""
+            prompt = self.query_one("#prompt", PromptArea)
+            if self._menu_open and self._menu_accept_via_enter(value):
+                return
+            prompt.text = ""
             # Wizard intercepts all input while active.
             if self._login_state is not None:
                 self._login_step(value)
@@ -510,6 +909,7 @@ def make_app(
                 return
             if not value:
                 return
+            self._record_history(value)
             if value.startswith("/"):
                 self._handle_command(value)
                 return
@@ -521,6 +921,104 @@ def make_app(
                 return
             self._start_turn(value)
 
+        def _menu_accept_via_enter(self, typed: str) -> bool:
+            if not self._menu_open:
+                return False
+            if self._menu_mode == "value":
+                return self._menu_accept(via_enter=True)
+
+            if typed.strip().lower() in _COMMANDS:
+                self._close_menu()
+                return False
+            return self._menu_accept(via_enter=True)
+
+        def on_key(self, event) -> None:
+            if self._menu_open and self._menu_items:
+                if event.key == "up":
+                    self._menu_index = (self._menu_index - 1) % len(self._menu_items)
+                    self._render_menu()
+                    event.stop()
+                    event.prevent_default()
+                elif event.key == "down":
+                    self._menu_index = (self._menu_index + 1) % len(self._menu_items)
+                    self._render_menu()
+                    event.stop()
+                    event.prevent_default()
+                elif event.key == "tab":
+                    if self._menu_accept(via_enter=False):
+                        event.stop()
+                        event.prevent_default()
+                elif event.key == "escape":
+                    self._close_menu()
+                    event.stop()
+                    event.prevent_default()
+                return
+
+            if event.key not in ("up", "down"):
+                return
+            if not self._history_nav_allowed(event.key):
+                return
+            moved = self._history_prev() if event.key == "up" else self._history_next()
+            if moved:
+                event.prevent_default()
+                event.stop()
+
+        def _record_history(self, value: str) -> None:
+            append_history(value)
+            self._history.append(value)
+            if len(self._history) > 1000:
+                self._history = self._history[-1000:]
+            self._history_pos = len(self._history)
+
+        def _history_nav_allowed(self, direction: str) -> bool:
+            if self._login_state is not None:
+                return False
+            if self._settings_state is not None:
+                return False
+            if self._provider_add_state is not None:
+                return False
+            if self._menu_open:
+                return False
+            prompt = self.query_one("#prompt", PromptArea)
+            if not prompt.has_focus:
+                return False
+            return self._prompt_on_boundary_line(direction)
+
+        def _prompt_on_boundary_line(self, direction: str) -> bool:
+            prompt = self.query_one("#prompt", PromptArea)
+            if hasattr(prompt, "document"):
+                cursor_row = prompt.cursor_location[0]
+                last_row = len(prompt.document.lines) - 1
+                if direction == "up":
+                    return cursor_row == 0
+                return cursor_row == last_row
+            return True
+
+        def _set_prompt_text(self, text: str) -> None:
+            prompt = self.query_one("#prompt", PromptArea)
+            prompt.value = text
+            if hasattr(prompt, "document"):
+                try:
+                    prompt.move_cursor(prompt.document.end)
+                except AttributeError:
+                    pass
+
+        def _history_prev(self) -> bool:
+            if self._history_pos <= 0:
+                return False
+            self._history_pos -= 1
+            self._set_prompt_text(self._history[self._history_pos])
+            return True
+
+        def _history_next(self) -> bool:
+            if self._history_pos >= len(self._history):
+                return False
+            self._history_pos += 1
+            if self._history_pos == len(self._history):
+                self._set_prompt_text("")
+            else:
+                self._set_prompt_text(self._history[self._history_pos])
+            return True
         def _handle_command(self, value: str) -> None:
             parts = value.split(maxsplit=1)
             cmd = parts[0].lower()
@@ -590,6 +1088,8 @@ def make_app(
             settings["effort"] = new_effort.value
             save_settings(settings)
             self._write(f"effort · {new_effort.value}", "meta")
+            self._write(f"effort · {new_effort.value}", "meta")
+            self._update_status_bar()
 
         def _cmd_model(self, arg: str) -> None:
             if not arg:
@@ -655,6 +1155,8 @@ def make_app(
             settings["effort"] = self.orchestrator.effort.value
             save_settings(settings)
             self._write(f"model · {arg}", "meta")
+            self._write(f"model · {arg}", "meta")
+            self._update_status_bar()
 
         def _cmd_memory(self) -> None:
             try:
@@ -690,6 +1192,7 @@ def make_app(
 
         def _cmd_settings(self) -> None:
             """Interactive provider/model picker with settings header."""
+            self._close_menu()
             prov_name = self.provider.name if self.provider else "(none)"
             model = (getattr(self.provider, "_model", "") or prov_name) if self.provider else "(none)"
             settings = load_settings()
@@ -848,6 +1351,13 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
+            self._write(
+                f"{provider_name} · {model_name} · effort "
+                f"{self.orchestrator.effort.value}",
+                "meta",
+            )
+            self.query_one("#prompt", PromptArea).focus()
+            self._update_status_bar()
 
         def _cmd_provider(self, arg: str) -> None:
             """Show, switch, or register providers."""
@@ -923,9 +1433,16 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
+            self._write(
+                f"{name} · {model} · effort "
+                f"{self.orchestrator.effort.value}",
+                "meta",
+            )
+            self._update_status_bar()
 
         def _cmd_provider_add_start(self) -> None:
             """Begin the interactive provider-registration wizard."""
+            self._close_menu()
             self._provider_add_state = {"step": 0, "data": {}}
             _key, prompt = _PROVIDER_ADD_STEPS[0]
             self._set_hint(f"{prompt}(Enter to submit, Esc to cancel)")
@@ -995,6 +1512,7 @@ def make_app(
 
         def _start_oauth_login(self, provider_id: str, info=None) -> None:
             """Begin the OAuth login flow for *provider_id*."""
+            self._close_menu()
             if info is None:
                 info = _builtin_provider_info(provider_id)
             if info is None or info.oauth is None:
@@ -1195,6 +1713,7 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
+            self._update_status_bar()
 
         def _cmd_login(self) -> None:
             """Authenticate (or re-authenticate) the active provider via OAuth."""
@@ -1215,41 +1734,103 @@ def make_app(
         # ---- turn execution --------------------------------------------
 
         def _start_turn(self, text: str) -> None:
+            self._close_menu()
             self._turn_active = True
+            self._turn_seq += 1
+            seq = self._turn_seq
             if self._has_turns:
                 self.query_one("#transcript", VerticalScroll).mount(Rule())
             self._has_turns = True
             self._write(f"{_USER_MARK} {text}", "u")
-            self._begin_assistant()
-            self._set_hint("thinking…  ·  esc to interrupt")
-            self.query_one("#prompt", Input).disabled = True
-            self._run_turn(text)
+            self._buffer = ""
+            self._current_md = None
+            self._first_token = False
+            self._live_tokens = 0
+            self._spinner_idx = 0
+            self._turn_started = time.monotonic()
+            indicator = Static("", id="turn-indicator")
+            self.query_one("#transcript", VerticalScroll).mount(indicator)
+            self._indicator = indicator
+            self._tick_indicator()
+            self._indicator_timer = self.set_interval(1 / 8, self._tick_indicator)
+            self._set_hint("esc to interrupt")
+            self.query_one("#prompt", PromptArea).disabled = True
+            self._run_turn(text, seq)
+
+        def _indicator_text(self) -> str:
+            frame = _SPINNER_FRAMES[self._spinner_idx % len(_SPINNER_FRAMES)]
+            secs = int(time.monotonic() - self._turn_started)
+            label = "Streaming…" if self._first_token else "Thinking…"
+            return (
+                f"[#e0a86b]{frame}[/] {label} "
+                f"({secs}s · ~{self._live_tokens} tok · esc to interrupt)"
+            )
+
+        def _tick_indicator(self) -> None:
+            if self._indicator is None:
+                return
+            try:
+                self._indicator.update(self._indicator_text())
+            except Exception:  # pragma: no cover - widget may be gone mid-tick
+                pass
+            self._spinner_idx += 1
+
+        def _stop_indicator(self) -> None:
+            if self._indicator_timer is not None:
+                self._indicator_timer.stop()
+                self._indicator_timer = None
+            if self._indicator is not None:
+                try:
+                    self._indicator.remove()
+                except Exception:  # pragma: no cover
+                    pass
+                self._indicator = None
 
         @work(thread=True, exclusive=True, group="turn")
-        def _run_turn(self, text: str) -> None:
+        def _run_turn(self, text: str, seq: int) -> None:
             def on_delta(chunk: str) -> None:
-                if not self._turn_active:
+                if not self._turn_active or seq != self._turn_seq:
                     return
-                self.call_from_thread(self._append_delta, chunk)
+                self.call_from_thread(self._append_delta, chunk, seq)
 
             try:
                 result = self.orchestrator.run_turn(text, on_delta=on_delta)
             except Exception as exc:  # keep the app alive on unexpected errors
-                self.call_from_thread(self._turn_error, exc)
+                self.call_from_thread(self._turn_error, exc, seq)
                 return
-            self.call_from_thread(self._turn_done, result)
+            self.call_from_thread(self._turn_done, result, seq)
 
-        def _append_delta(self, chunk: str) -> None:
+        def _append_delta(self, chunk: str, seq: int) -> None:
+            if seq != self._turn_seq or not self._turn_active:
+                return
+            if not self._first_token:
+                self._first_token = True
+                self._begin_assistant()
             self._buffer += chunk
             if self._current_md is not None:
                 self._current_md.update(self._buffer)
+            self._live_tokens = _estimate_tokens(self._buffer)
             self._scroll_end()
 
-        def _turn_done(self, result) -> None:
+        def _turn_done(self, result, seq: int) -> None:
+            if seq != self._turn_seq or not self._turn_active:
+                return
+            self._stop_indicator()
+            if not self._first_token:
+                # Nothing streamed (e.g. empty stream or non-delta path).
+                self._first_token = True
+                self._begin_assistant()
             if self._current_md is not None and self._buffer != result.text:
-                # Non-streaming providers deliver everything in one delta; make
-                # sure the final rendered text matches the result exactly.
+                # Non-streaming providers deliver everything at once; make sure
+                # the final rendered text matches the result exactly.
                 self._current_md.update(result.text)
+                self._buffer = result.text
+            # Accumulate authoritative session totals for a future status bar.
+            if result.usage is not None:
+                self._session_tokens += result.usage.total_tokens
+            self._session_tool_calls += result.tool_calls_made
+            self._last_usage = result.usage
+            # End-of-turn meta line uses the AUTHORITATIVE real usage totals.
             # Keep the transcript quiet: only surface a dim meta line when there
             # is something noteworthy (tokens, tool calls, or degradation).
             parts: list[str] = []
@@ -1264,17 +1845,33 @@ def make_app(
                 )
             if parts:
                 self._write(" · ".join(parts), "meta")
+            usage = result.usage
+            if usage is not None:
+                self._session_tokens += usage.total_tokens or 0
+                self._last_ctx_tokens = usage.prompt_tokens or 0
+                info = self._active_model_info()
+                if info is not None:
+                    p = info.pricing
+                    self._session_cost += (
+                        (usage.prompt_tokens or 0) / 1_000_000 * (p.input or 0)
+                        + (usage.completion_tokens or 0) / 1_000_000 * (p.output or 0)
+                    )
+            self._update_status_bar()
             self._finish_turn()
 
-        def _turn_error(self, exc: Exception) -> None:
+        def _turn_error(self, exc: Exception, seq: int) -> None:
+            if seq != self._turn_seq or not self._turn_active:
+                return
+            self._stop_indicator()
             self._write(f"Error: {exc}", "warn")
             self._finish_turn()
 
         def _finish_turn(self) -> None:
             self._turn_active = False
+            self._stop_indicator()
             self._current_md = None
             self._set_hint(_DEFAULT_HINT)
-            prompt = self.query_one("#prompt", Input)
+            prompt = self.query_one("#prompt", PromptArea)
             prompt.disabled = False
             prompt.focus()
 
@@ -1296,15 +1893,47 @@ def make_app(
                 self._write("(cancelled)", "warn")
                 self._set_hint(_DEFAULT_HINT)
                 return
-            if not self._turn_active:
+            if self._turn_active:
+                self.workers.cancel_group(self, "turn")
+                self._turn_active = False
+                self._stop_indicator()
+                self._write("(interrupted)", "warn")
+                self._finish_turn()
                 return
-            self.workers.cancel_group(self, "turn")
-            self._write("(interrupted)", "warn")
-            self._finish_turn()
+            if self._menu_open:
+                self._close_menu()
+                return
+            prompt = self.query_one("#prompt", PromptArea)
+            if prompt.text:
+                prompt.text = ""
+        def action_ctrl_c(self) -> None:
+            # While a turn runs, a single Ctrl+C cancels it (like Esc) rather
+            # than quitting. Otherwise it's the first tap of double-tap-to-quit.
+            if self._turn_active:
+                self.action_interrupt()
+                return
+            if self._ctrl_c_pending:
+                self.exit()
+                return
+            self._ctrl_c_pending = True
+            self._set_hint("press ctrl+c again to quit")
+            if self._ctrl_c_timer is not None:
+                self._ctrl_c_timer.stop()
+            self._ctrl_c_timer = self.set_timer(1.5, self._reset_ctrl_c)
+
+        def _reset_ctrl_c(self) -> None:
+            self._ctrl_c_pending = False
+            self._ctrl_c_timer = None
+            if not self._turn_active:
+                self._set_hint(_DEFAULT_HINT)
 
         def action_clear(self) -> None:
             self.query_one("#transcript", VerticalScroll).remove_children()
             self._has_turns = False
+            self.call_after_refresh(self._finish_clear)
+
+        def _finish_clear(self) -> None:
+            self._render_welcome()
             self._write("cleared.", "meta")
 
     return RickshawTUI()
