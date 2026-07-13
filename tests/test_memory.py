@@ -15,7 +15,12 @@ import pytest
 
 from rickshaw.memory._chroma_index import chroma_available
 from rickshaw.memory._math import cosine_similarity
-from rickshaw.memory.embedder import ProviderEmbedder, TFIDFEmbedder
+from rickshaw.memory.embedder import (
+    Model2VecEmbedder,
+    ProviderEmbedder,
+    TFIDFEmbedder,
+    make_embedder,
+)
 from rickshaw.memory.ranker import Ranker
 from rickshaw.memory.record import MemoryRecord, MemoryScope, MemoryType
 from rickshaw.memory.service import MemoryService
@@ -261,9 +266,12 @@ def test_service_dedupe_on_write():
     service = MemoryService(embedder=TFIDFEmbedder(dim=32))
     rec1 = service.write("the sky is blue")
     assert rec1 is not None
-    # Same text should be deduped
+    # Same text should be deduped — Phase 4: update-on-duplicate returns the
+    # existing record with bumped use_count instead of None.
     rec2 = service.write("the sky is blue")
-    assert rec2 is None
+    assert rec2 is not None
+    assert rec2.id == rec1.id
+    assert rec2.use_count >= 1  # was bumped by the duplicate write
 
 
 def test_service_write_different_texts():
@@ -278,8 +286,11 @@ def test_service_write_observations():
     service = MemoryService(embedder=TFIDFEmbedder(dim=32))
     resp = Response(text="Hello, I'm the assistant", model="test", usage=TokenUsage())
     records = service.write_observations(resp)
-    assert len(records) == 1
-    assert records[0].text == "Hello, I'm the assistant"
+    # Phase 4: distillation splits into atomic records. A short single-sentence
+    # response produces at least one record.
+    assert len(records) >= 1
+    # The distilled text should contain the assistant's content.
+    assert any("assistant" in r.text.lower() for r in records)
 
 
 def test_service_write_observations_empty_text():
@@ -535,3 +546,453 @@ def test_dispatch_unknown_tool():
     # Registry surfaces errors as a structured {"error": ...} payload.
     assert isinstance(result, dict)
     assert "unknown tool" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: unified sqlite-vec store (float32 BLOB + vec0 + brute-force fallback)
+# ---------------------------------------------------------------------------
+
+def test_store_embedding_stored_as_float32_blob():
+    """Embeddings are persisted as compact float32 BLOBs, not JSON text."""
+    store = MemoryStore(vector_dim=8, use_vector_index=False)
+    rec = MemoryRecord(id="r1", text="hello", embedding=[1.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0])
+    store.put(rec)
+    raw = store._conn.execute("SELECT embedding FROM memories WHERE id='r1'").fetchone()[0]
+    assert isinstance(raw, (bytes, bytearray))
+    assert len(raw) == 8 * 4  # 8 dims * 4 bytes per float32
+    # Round-trips exactly (within float32 precision).
+    fetched = store.get("r1")
+    assert fetched.embedding[0] == pytest.approx(1.0)
+    assert fetched.embedding[2] == pytest.approx(0.5)
+
+
+def test_store_search_identical_results_indexed_vs_bruteforce():
+    """The vec0 indexed path and brute-force path return identical rankings."""
+    vec = [1.0] + [0.0] * 15
+    recs = [
+        MemoryRecord(id="near", text="near", embedding=vec),
+        MemoryRecord(id="far", text="far", embedding=[0.0] * 15 + [1.0]),
+    ]
+    # Force brute-force.
+    brute = MemoryStore(vector_dim=16, use_vector_index=False)
+    for r in recs:
+        brute.put(r)
+    brute_hits = brute.search(vec, limit=2)
+    # Use the indexed path if available; otherwise this just re-confirms brute.
+    indexed = MemoryStore(vector_dim=16, use_vector_index=True)
+    for r in recs:
+        indexed.put(r)
+    indexed_hits = indexed.search(vec, limit=2)
+    # Both must agree on the top hit regardless of backend.
+    assert brute_hits[0][0].id == "near"
+    assert indexed_hits[0][0].id == "near"
+    assert brute_hits[0][1] == pytest.approx(1.0, abs=1e-5)
+    assert indexed_hits[0][1] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_store_migrates_json_embeddings_to_blob(tmp_path):
+    """A legacy DB with JSON-text embeddings is migrated to float32 BLOBs on open."""
+    import sqlite3 as _sqlite3
+    db = tmp_path / "legacy.db"
+    c = _sqlite3.connect(str(db))
+    c.execute(
+        """CREATE TABLE memories (
+            id TEXT PRIMARY KEY, text TEXT NOT NULL, embedding TEXT NOT NULL,
+            scope TEXT NOT NULL, type TEXT NOT NULL, importance REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL, last_used_at TEXT NOT NULL,
+            use_count INTEGER NOT NULL DEFAULT 0, sensitive INTEGER NOT NULL DEFAULT 0,
+            superseded_by TEXT)"""
+    )
+    c.execute(
+        "INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("r1", "hello", json.dumps([1.0, 0.5, 0.0, 0.0]), "session", "fact", 0.5,
+         "2025-01-01T00:00:00+00:00", "2025-01-01T00:00:00+00:00", 0, 0, None),
+    )
+    c.commit()
+    c.close()
+
+    store = MemoryStore(str(db), vector_dim=None, use_vector_index=False)
+    rec = store.get("r1")
+    assert rec is not None
+    assert rec.embedding == [1.0, 0.5, 0.0, 0.0]
+    raw = store._conn.execute("SELECT embedding FROM memories WHERE id='r1'").fetchone()[0]
+    assert isinstance(raw, (bytes, bytearray))  # migrated to BLOB
+    assert len(raw) == 16  # 4 floats * 4 bytes
+
+
+def test_store_vec0_index_backfills_existing_rows(tmp_path):
+    """Rows present before the store opens are backfilled into the vec0 index."""
+    db = tmp_path / "mem.db"
+    vec = [1.0] + [0.0] * 15
+    # First store writes a row (no index), then a second store opens with an
+    # index and must pick up the pre-existing row.
+    base = MemoryStore(str(db), vector_dim=16, use_vector_index=False)
+    base.put(MemoryRecord(id="r1", text="hello", embedding=vec))
+    base.close()
+    # Re-open with index enabled (will use vec0 if available, else fallback).
+    store = MemoryStore(str(db), vector_dim=16, use_vector_index=True)
+    hits = store.search(vec, limit=5)
+    assert any(r.id == "r1" for r, _ in hits)
+
+
+def test_store_superseded_removed_from_index():
+    """mark_superseded drops the record from the index so it can't surface."""
+    store = MemoryStore(vector_dim=8, use_vector_index=True)
+    vec = [1.0] + [0.0] * 7
+    store.put(MemoryRecord(id="old", text="old", embedding=vec))
+    store.put(MemoryRecord(id="new", text="new", embedding=vec))
+    store.mark_superseded("old", "new")
+    hits = store.search(vec, limit=5)
+    ids = [r.id for r, _ in hits]
+    assert "old" not in ids
+    assert "new" in ids
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: tiered embedders (Model2Vec default, FastEmbed opt-in, make_embedder)
+# ---------------------------------------------------------------------------
+
+def test_model2vec_embedder_loads_vendored_model():
+    """The default Model2VecEmbedder loads the vendored model fully offline."""
+    e = Model2VecEmbedder()
+    assert e.dimension == 128
+    v = e.embed("hello world")
+    assert len(v) == 128
+    assert any(abs(x) > 0 for x in v)  # not all zeros
+
+
+def test_model2vec_embedder_semantic_beats_tfidf():
+    """Model2Vec captures semantic similarity that TF-IDF cannot."""
+    m2v = Model2VecEmbedder()
+    # Synonyms with no word overlap should be more similar than unrelated text.
+    sim_syn = cosine_similarity(
+        m2v.embed("the feline is sleeping on the mat"),
+        m2v.embed("a cat is resting on the rug"),
+    )
+    sim_unrel = cosine_similarity(
+        m2v.embed("the feline is sleeping on the mat"),
+        m2v.embed("database servers process concurrent queries"),
+    )
+    assert sim_syn > sim_unrel
+
+
+def test_model2vec_embedder_deterministic():
+    """Same text produces the same vector across calls."""
+    e = Model2VecEmbedder()
+    v1 = e.embed("deterministic test")
+    v2 = e.embed("deterministic test")
+    assert v1 == pytest.approx(v2, abs=1e-6)
+
+
+def test_make_embedder_tiers():
+    """make_embedder selects the correct tier by name."""
+    assert isinstance(make_embedder("tfidf", dim=16), TFIDFEmbedder)
+    assert isinstance(make_embedder("model2vec"), Model2VecEmbedder)
+    # Unknown tier raises.
+    with pytest.raises(ValueError):
+        make_embedder("nonexistent")
+
+
+def test_make_embedder_default_is_model2vec():
+    """The default tier (no arg) is Model2Vec, not TF-IDF."""
+    e = make_embedder()
+    assert isinstance(e, Model2VecEmbedder)
+
+
+def test_service_default_embedder_is_model2vec():
+    """MemoryService defaults to Model2VecEmbedder when no embedder is passed."""
+    service = MemoryService()
+    assert isinstance(service.embedder, Model2VecEmbedder)
+
+
+def test_service_reembeds_on_tier_change(tmp_path):
+    """Switching embedder tier re-embeds all existing records."""
+    db = str(tmp_path / "mem.db")
+    # Write with TF-IDF (32-dim).
+    svc_tfidf = MemoryService(
+        embedder=TFIDFEmbedder(dim=32), db_path=db,
+    )
+    svc_tfidf.write("user likes dark mode")
+    svc_tfidf.write("python is a great language")
+    recs = svc_tfidf.store.all_records()
+    assert all(len(r.embedding) == 32 for r in recs)
+    svc_tfidf.store.close()
+
+    # Re-open with Model2Vec (128-dim) — records must be re-embedded.
+    svc_m2v = MemoryService(
+        embedder=Model2VecEmbedder(), db_path=db,
+    )
+    recs = svc_m2v.store.all_records()
+    assert all(len(r.embedding) == 128 for r in recs)
+    # Retrieval should still work after re-embedding.
+    results = svc_m2v.assemble_context("dark mode preference")
+    assert len(results) > 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: hybrid retrieval (FTS5 BM25 + dense KNN + RRF)
+# ---------------------------------------------------------------------------
+
+from rickshaw.memory.hybrid import (
+    HybridRetriever,
+    FTS5Index,
+    reciprocal_rank_fusion,
+)
+
+
+def test_rrf_fuses_ranked_lists():
+    """RRF combines two ranked lists, rewarding items that appear in both."""
+    list_a = [("a", 0.9), ("b", 0.8), ("c", 0.7)]
+    list_b = [("b", 0.95), ("c", 0.6), ("d", 0.5)]
+    fused = reciprocal_rank_fusion([list_a, list_b], k=60)
+    # 'b' and 'c' appear in both lists so should outrank 'a' and 'd'.
+    assert fused["b"] > fused["a"]
+    assert fused["c"] > fused["a"]
+    assert fused["b"] > fused["d"]
+
+
+def test_fts5_index_search_returns_relevant():
+    """FTS5 BM25 returns records whose text matches the query terms."""
+    store = MemoryStore(vector_dim=8, use_vector_index=False)
+    store.put(MemoryRecord(id="r1", text="the quick brown fox jumps", embedding=[1.0] * 8, scope=MemoryScope.GLOBAL))
+    store.put(MemoryRecord(id="r2", text="database transaction isolation", embedding=[1.0] * 8, scope=MemoryScope.GLOBAL))
+    fts = FTS5Index(store._conn)
+    fts.upsert(MemoryRecord(id="r1", text="the quick brown fox jumps", embedding=[], scope=MemoryScope.GLOBAL))
+    fts.upsert(MemoryRecord(id="r2", text="database transaction isolation", embedding=[], scope=MemoryScope.GLOBAL))
+    hits = fts.search("fox", scope_filter=None, limit=5)
+    ids = [h[0] for h in hits]
+    assert "r1" in ids
+    assert "r2" not in ids
+
+
+def test_fts5_index_scope_filter():
+    """FTS5 search respects scope filtering."""
+    store = MemoryStore(vector_dim=8, use_vector_index=False)
+    fts = FTS5Index(store._conn)
+    fts.upsert(MemoryRecord(id="r1", text="dark mode preference", embedding=[], scope=MemoryScope.GLOBAL))
+    fts.upsert(MemoryRecord(id="r2", text="dark mode setting", embedding=[], scope=MemoryScope.SESSION))
+    hits = fts.search("dark mode", scope_filter=[MemoryScope.GLOBAL], limit=5)
+    assert all(h[0] == "r1" for h in hits)
+    assert len(hits) == 1
+
+
+def test_hybrid_retriever_combines_lexical_and_dense():
+    """HybridRetriever fuses BM25 + dense results via RRF."""
+    store = MemoryStore(vector_dim=128, use_vector_index=False)
+    embedder = Model2VecEmbedder()
+    retriever = HybridRetriever(store, embedder)
+    assert retriever.lexical_enabled
+    # Write a record with a distinctive term (great for lexical) and semantic content.
+    retriever.store.put(MemoryRecord(
+        id="r1", text="user prefers dark mode for editing code",
+        embedding=embedder.embed("user prefers dark mode for editing code"),
+        scope=MemoryScope.GLOBAL,
+    ))
+    retriever.index_record(MemoryRecord(
+        id="r1", text="user prefers dark mode for editing code",
+        embedding=[], scope=MemoryScope.GLOBAL,
+    ))
+    candidates = retriever.retrieve("dark mode preference", scope_filter=[MemoryScope.GLOBAL], limit=5)
+    assert len(candidates) > 0
+    assert candidates[0][0].id == "r1"
+
+
+def test_hybrid_retriever_catches_semantic_match_without_term_overlap():
+    """Hybrid retrieval finds semantically related memories even with no shared words."""
+    service = MemoryService(embedder=Model2VecEmbedder())
+    from rickshaw.memory.record import MemoryScope as MS, MemoryType as MT
+    service.write("I like my editor colors dark with low brightness", scope=MS.GLOBAL, type=MT.PREFERENCE)
+    service.write("PostgreSQL handles concurrent transactions well", scope=MS.GLOBAL, type=MT.FACT)
+    # Query uses different words but same meaning as the first record.
+    results = service.assemble_context("what are my display preferences")
+    texts = [r.text for r in results]
+    assert any("dark" in t.lower() for t in texts)
+
+
+def test_service_hybrid_disabled_falls_back_to_dense():
+    """hybrid=False disables FTS5 and uses dense-only search."""
+    service = MemoryService(embedder=Model2VecEmbedder(dim=None) if False else TFIDFEmbedder(dim=32), hybrid=False)
+    assert service.retriever is None
+    service.write("test memory about cats")
+    results = service.assemble_context("cats")
+    assert len(results) > 0
+
+
+def test_hybrid_fts_index_stays_in_sync_on_delete():
+    """Deleting a record removes it from the FTS5 index too."""
+    store = MemoryStore(vector_dim=8, use_vector_index=False)
+    embedder = TFIDFEmbedder(dim=8)
+    retriever = HybridRetriever(store, embedder)
+    store.register_fts_index(retriever._fts)
+    rec = MemoryRecord(id="r1", text="unique searchable phrase", embedding=[1.0] * 8, scope=MemoryScope.GLOBAL)
+    store.put(rec)
+    # Should find it.
+    hits = retriever.retrieve("unique searchable phrase", scope_filter=[MemoryScope.GLOBAL], limit=5)
+    assert any(r.id == "r1" for r, _ in hits)
+    # Delete and confirm it's gone from both.
+    store.delete("r1")
+    hits = retriever.retrieve("unique searchable phrase", scope_filter=[MemoryScope.GLOBAL], limit=5)
+    assert not any(r.id == "r1" for r, _ in hits)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: better memory writing (distillation, dedup, pinning, personability)
+# ---------------------------------------------------------------------------
+
+from rickshaw.memory.distill import distill_turn, _classify_type, _is_sensitive
+
+
+def test_distill_heuristic_extracts_preferences_from_user_input():
+    """The heuristic distiller extracts preference records from user input."""
+    records = distill_turn(
+        user_input="I prefer dark mode and I like concise answers",
+        assistant_text="Got it, I'll keep responses concise.",
+        scope=MemoryScope.SESSION,
+    )
+    prefs = [r for r in records if r.type == MemoryType.PREFERENCE]
+    assert len(prefs) >= 1
+    assert all(r.scope == MemoryScope.GLOBAL for r in prefs)
+    assert all(r.pinned for r in prefs)
+
+
+def test_distill_heuristic_classifies_types():
+    """The heuristic distiller classifies record types correctly."""
+    assert _classify_type("we decided to use PostgreSQL") == MemoryType.DECISION
+    assert _classify_type("the build failed with an error") == MemoryType.ERROR
+    assert _classify_type("I prefer Python over Java") == MemoryType.PREFERENCE
+    assert _classify_type("the sky is blue") == MemoryType.FACT
+
+
+def test_distill_heuristic_detects_sensitive():
+    """The heuristic distiller marks sensitive content."""
+    assert _is_sensitive("my API key is sk-abc123")
+    assert _is_sensitive("the password is hunter2")
+    assert not _is_sensitive("the sky is blue")
+
+
+def test_distill_heuristic_splits_atomic_records():
+    """The distiller splits multi-sentence text into atomic records."""
+    records = distill_turn(
+        user_input="",
+        assistant_text="PostgreSQL is a great database. We decided to use it. The connection failed with an error.",
+        scope=MemoryScope.SESSION,
+    )
+    assert len(records) >= 3
+    types = {r.type for r in records}
+    assert MemoryType.FACT in types
+    assert MemoryType.DECISION in types
+    assert MemoryType.ERROR in types
+
+
+def test_distill_uses_llm_when_provider_reachable():
+    """When a provider is available, LLM distillation is used."""
+    from rickshaw.providers.base import Effort, Message, Response, TokenUsage
+
+    class _DistillProvider:
+        @property
+        def name(self):
+            return "distill-test"
+
+        def complete(self, messages, effort=Effort.LOW, tools=None, **kwargs):
+            return Response(
+                text='[{"text": "user likes dark mode", "type": "preference", "scope": "global", "sensitive": false, "pinned": true}]',
+                model="distill-test",
+                usage=TokenUsage(),
+            )
+
+    records = distill_turn(
+        user_input="I like dark mode",
+        assistant_text="ok",
+        provider=_DistillProvider(),
+    )
+    assert len(records) == 1
+    assert records[0].type == MemoryType.PREFERENCE
+    assert records[0].pinned
+
+
+def test_distill_falls_back_on_llm_failure():
+    """When the LLM call fails, heuristic distillation is used."""
+    class _BrokenProvider:
+        @property
+        def name(self):
+            return "broken"
+
+        def complete(self, messages, effort=None, tools=None, **kwargs):
+            raise ConnectionError("unreachable")
+
+    records = distill_turn(
+        user_input="I prefer dark mode",
+        assistant_text="ok noted",
+        provider=_BrokenProvider(),
+    )
+    # Heuristic fallback still produces records.
+    assert len(records) > 0
+
+
+def test_service_dedup_is_scope_aware():
+    """A session fact and a global fact with similar text are not duplicates."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    r1 = service.write("the project uses Python", scope=MemoryScope.SESSION)
+    r2 = service.write("the project uses Python", scope=MemoryScope.GLOBAL)
+    assert r1 is not None
+    assert r2 is not None
+    assert r1.id != r2.id
+
+
+def test_service_dedup_updates_on_duplicate():
+    """A duplicate bumps use_count and last_used_at instead of discarding."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    r1 = service.write("the sky is blue", scope=MemoryScope.SESSION)
+    assert r1.use_count == 0
+    r2 = service.write("the sky is blue", scope=MemoryScope.SESSION)
+    assert r2.id == r1.id
+    assert r2.use_count == 1
+    assert r2.last_used_at >= r1.last_used_at
+
+
+def test_service_pinning():
+    """Pinning marks a record as always-available to the assembler."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    rec = service.write("user's name is Alice", scope=MemoryScope.GLOBAL)
+    service.pin(rec.id)
+    pinned = service.pinned_records()
+    assert any(r.id == rec.id for r in pinned)
+    service.unpin(rec.id)
+    pinned = service.pinned_records()
+    assert not any(r.id == rec.id for r in pinned)
+
+
+def test_service_write_observations_extracts_preferences():
+    """write_observations extracts preference records from user input."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    resp = Response(text="Got it.", model="test", usage=TokenUsage())
+    records = service.write_observations(resp, user_input="I prefer dark mode for coding")
+    prefs = [r for r in records if r.type == MemoryType.PREFERENCE]
+    assert len(prefs) >= 1
+    assert all(r.scope == MemoryScope.GLOBAL for r in prefs)
+
+
+def test_service_assemble_context_includes_pinned():
+    """Pinned preference records are always in the assembled context."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32), context_budget=5)
+    # Write a pinned preference and an unrelated fact.
+    rec = service.write(
+        "user's name is Alice", scope=MemoryScope.GLOBAL,
+        type=MemoryType.PREFERENCE, pinned=True,
+    )
+    service.write("PostgreSQL is great for OLTP", scope=MemoryScope.GLOBAL)
+    # Query for something completely unrelated — pinned record should still appear.
+    results = service.assemble_context("database transactions")
+    ids = [r.id for r in results]
+    assert rec.id in ids
+
+
+def test_service_write_with_pinned_flag():
+    """write(pinned=True) stores the pinned flag in extra metadata."""
+    service = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    rec = service.write(
+        "I like concise answers", scope=MemoryScope.GLOBAL,
+        type=MemoryType.PREFERENCE, pinned=True,
+    )
+    assert rec is not None
+    assert rec.extra.get("pinned") is True

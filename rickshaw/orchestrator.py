@@ -247,8 +247,11 @@ class Orchestrator:
                 warnings.append(_PROVIDER_UNREACHABLE_MSG)
                 break
 
-        # Write observations
-        records = self.memory.write_observations(response)
+        # Write observations — heuristic distillation in the hot path (fast,
+        # offline). LLM-based re-distillation is deferred to the worker.
+        records = self.memory.write_observations(
+            response, user_input=task_input,
+        )
 
         # Enqueue deferred jobs
         for rec in records:
@@ -324,7 +327,9 @@ class Orchestrator:
         response = Response(
             text="".join(parts), model=self.provider.name, effort=self.effort,
         )
-        records = self.memory.write_observations(response)
+        records = self.memory.write_observations(
+            response, user_input=task_input,
+        )
         for rec in records:
             self.queue.enqueue(Job(
                 type=JobType.IMPORTANCE_SCORING,
