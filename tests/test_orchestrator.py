@@ -8,6 +8,7 @@ from typing import Any, Iterator
 import httpx
 import pytest
 
+from rickshaw import events
 from rickshaw.memory.embedder import TFIDFEmbedder
 from rickshaw.memory.service import MemoryService
 from rickshaw.orchestrator import Orchestrator
@@ -22,6 +23,7 @@ from rickshaw.providers.base import (
     ToolSpec,
 )
 from rickshaw.queue import JobQueue
+from rickshaw.trace_store import TraceStore
 from rickshaw_ai.errors import ConnectionError as RAIConnectionError
 
 
@@ -465,3 +467,258 @@ def test_tool_followup_local_connection_error_fails_fast():
 
     assert "http://localhost:11434/v1" in str(excinfo.value)
     assert len(provider.call_log) == 2
+
+
+# ---------------------------------------------------------------------------
+# LLM visibility event / trace tests
+# ---------------------------------------------------------------------------
+
+
+def test_on_event_simple_turn():
+    """A non-streaming simple turn emits the expected lifecycle events."""
+    provider = _FakeProvider(function_calling=False)
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    queue = JobQueue()
+    orch = Orchestrator(provider=provider, memory=memory, queue=queue)
+
+    captured: list[events.TurnEvent] = []
+    result = orch.run_turn("Hello", on_event=captured.append)
+
+    assert result.text == "Final answer"
+    types = [e.type for e in captured]
+    assert types == [
+        "turn_start",
+        "context_start",
+        "context_done",
+        "prompt_built",
+        "llm_call_start",
+        "llm_call_done",
+        "text_delta",
+        "memory_write",
+        "job_enqueue",
+        "turn_done",
+    ]
+    assert captured[0].turn_id
+    assert captured[0].task_input == "Hello"
+    assert captured[2].record_count == 0
+    assert captured[3].message_count == 2
+    assert captured[5].model == "fake"
+    assert captured[-1].tool_calls_made == 0
+    assert captured[-1].degraded is False
+
+
+def test_on_event_tool_call_turn():
+    """A turn that dispatches a tool emits tool-call lifecycle events."""
+    provider = _FakeProvider(function_calling=True)
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    queue = JobQueue()
+    orch = Orchestrator(provider=provider, memory=memory, queue=queue)
+
+    captured: list[events.TurnEvent] = []
+    result = orch.run_turn("Remember something", on_event=captured.append)
+
+    assert result.text == "Final answer"
+    assert result.tool_calls_made == 1
+    types = [e.type for e in captured]
+    assert types == [
+        "turn_start",
+        "context_start",
+        "context_done",
+        "prompt_built",
+        "llm_call_start",
+        "llm_call_done",
+        "tool_call_start",
+        "tool_call_done",
+        "llm_call_start",
+        "llm_call_done",
+        "text_delta",
+        "memory_write",
+        "job_enqueue",
+        "turn_done",
+    ]
+    start_event = captured[6]
+    assert start_event.tool_name == "remember"
+    assert start_event.arguments == {"fact": "test fact from provider"}
+    done_event = captured[7]
+    assert done_event.tool_name == "remember"
+    assert done_event.duration_ms >= 0
+
+
+def test_on_event_retry_events():
+    """Transient provider failures emit Retry events before each retry."""
+    provider = _FakeProvider(fail_on_call=True)
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    queue = JobQueue()
+    orch = Orchestrator(
+        provider=provider, memory=memory, queue=queue, retry_backoff=0,
+    )
+
+    captured: list[events.TurnEvent] = []
+    result = orch.run_turn("What do you know?", on_event=captured.append)
+
+    assert result.degraded is True
+    types = [e.type for e in captured]
+    retry_events = [e for e in captured if e.type == "retry"]
+    assert len(retry_events) == orch.max_retries
+    assert retry_events[0].attempt == 1
+    assert retry_events[0].max_retries == orch.max_retries
+    assert retry_events[0].delay == 0.0
+    assert types.count("llm_call_start") == orch.max_retries + 1
+    assert types[-2] == "degraded"
+    assert types[-1] == "turn_done"
+
+
+def test_on_event_degraded_fallback():
+    """Falling back to local memory emits a Degraded event."""
+    provider = _FakeProvider(fail_on_call=True)
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    memory.write("stored fact")
+    queue = JobQueue()
+    orch = Orchestrator(
+        provider=provider, memory=memory, queue=queue, retry_backoff=0,
+    )
+
+    captured: list[events.TurnEvent] = []
+    result = orch.run_turn("stored fact", on_event=captured.append)
+
+    assert result.degraded is True
+    degraded_events = [e for e in captured if e.type == "degraded"]
+    assert len(degraded_events) == 1
+    assert "local memory" in degraded_events[0].reason
+    assert captured[-1].type == "turn_done"
+    assert captured[-1].degraded is True
+
+
+def test_trace_store_persists_events(tmp_path):
+    """The trace store receives and persists every TurnEvent."""
+    provider = _FakeProvider(function_calling=False)
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    queue = JobQueue()
+    db_path = str(tmp_path / "trace.db")
+    trace_store = TraceStore(db_path)
+    orch = Orchestrator(
+        provider=provider, memory=memory, queue=queue, trace_store=trace_store,
+    )
+
+    captured: list[events.TurnEvent] = []
+    result = orch.run_turn("Hello", on_event=captured.append)
+
+    assert result.text == "Final answer"
+    trace_store.flush()
+    turn_id = captured[0].turn_id
+    trace = trace_store.get_trace(turn_id)
+    assert trace is not None
+    assert trace["task_input"] == "Hello"
+    assert trace["status"] == "completed"
+    persisted_types = [e["type"] for e in trace["events"]]
+    assert persisted_types == [e.type for e in captured]
+    trace_store.close()
+
+
+class _StreamingFakeProvider(LLMProvider):
+    """Yields structured stream events and supports tool-call rounds."""
+
+    def __init__(self, responses: list[Response] | None = None) -> None:
+        self._call_count = 0
+        self._responses = responses or []
+        self.call_log: list[dict] = []
+
+    @property
+    def name(self) -> str:
+        return "fake-stream"
+
+    def complete(
+        self,
+        messages: list[Message],
+        effort: Effort = Effort.MEDIUM,
+        tools: list[ToolSpec] | None = None,
+        **kwargs: Any,
+    ) -> Response:
+        raise NotImplementedError("use stream_events")
+
+    def stream_events(
+        self,
+        messages: list[Message],
+        effort: Effort = Effort.MEDIUM,
+        tools: list[ToolSpec] | None = None,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> Iterator[events.StreamEvent]:
+        self._call_count += 1
+        self.call_log.append({"tools": tools})
+        idx = self._call_count - 1
+        response = self._responses[idx] if idx < len(self._responses) else Response(
+            text="", model=self.name, usage=TokenUsage(), tool_calls=[]
+        )
+
+        for tc in response.tool_calls:
+            yield events.ToolCallStart(id=tc.id, name=tc.name)
+            yield events.ToolCallEnd(call=tc)
+
+        parts = response.text.split()
+        for i, part in enumerate(parts):
+            yield events.TextDelta(text=part if i == 0 else f" {part}")
+
+        yield events.StreamDone(
+            text=response.text,
+            model=response.model,
+            usage=response.usage,
+            tool_calls=response.tool_calls,
+        )
+
+    def available_models(self) -> list[str]:
+        return [self.name]
+
+    def validate(self) -> None:
+        pass
+
+    def capabilities(self) -> Capabilities:
+        return Capabilities(
+            streaming=True,
+            function_calling=True,
+            max_context_tokens=4096,
+        )
+
+
+def test_streaming_tool_call_round_emits_events_and_deltas():
+    """Streaming providers can execute tool-call rounds and emit deltas."""
+    provider = _StreamingFakeProvider([
+        Response(
+            text="",
+            model="fake-stream",
+            usage=TokenUsage(),
+            tool_calls=[
+                ToolCall(
+                    id="tc1",
+                    name="remember",
+                    arguments={"fact": "streamed fact"},
+                )
+            ],
+        ),
+        Response(
+            text="Final answer",
+            model="fake-stream",
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=2, total_tokens=12),
+            tool_calls=[],
+        ),
+    ])
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    queue = JobQueue()
+    orch = Orchestrator(provider=provider, memory=memory, queue=queue)
+
+    deltas: list[str] = []
+    captured: list[events.TurnEvent] = []
+    result = orch.run_turn(
+        "Remember a streamed fact",
+        on_delta=deltas.append,
+        on_event=captured.append,
+    )
+
+    assert result.text == "Final answer"
+    assert result.tool_calls_made == 1
+    assert "".join(deltas).strip() == "Final answer"
+    types = [e.type for e in captured]
+    assert "text_delta" in types
+    assert "tool_call_start" in types
+    assert "tool_call_done" in types
+    assert types[-1] == "turn_done"

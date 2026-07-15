@@ -17,6 +17,7 @@ import httpx
 
 from rickshaw.config import is_local_url
 from rickshaw.providers import _bridge
+from rickshaw.events import StreamEvent
 from rickshaw.providers.base import (
     Capabilities,
     EmbeddingMixin,
@@ -168,20 +169,22 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
             result, effort=effort, tool_calls=tool_calls, fallback_model=self._model
         )
 
-    def stream(
+    def stream_events(
         self,
         messages: list[Message],
         effort: Effort = Effort.MEDIUM,
         tools: list[ToolSpec] | None = None,
         tool_choice: str | None = None,
         **kwargs: Any,
-    ) -> Iterator[str]:
+    ) -> Iterator[StreamEvent]:
         req = _bridge.GenerateRequest(
             messages=_bridge.to_ai_messages(messages),
+            tools=_bridge.to_ai_tools(tools),
+            tool_choice=tool_choice if tools else None,
             reasoning=_bridge.Reasoning(effort=_EFFORT_MAP[effort]),
             provider_options=dict(kwargs),
         )
-        yield from _bridge.stream_text(
+        yield from _bridge.stream_events(
             self._provider_info(),
             self._model_info(),
             self._api_key,

@@ -1,4 +1,4 @@
-# Future Roadmap
+# Future Roadmap (DEPRECATED - IGNORE)
 
 Concise roadmap for parts of Rickshaw that are intentionally simple today and
 are expected to evolve. This is a roadmap, not a design doc.

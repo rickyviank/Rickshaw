@@ -162,6 +162,31 @@ surfaced.
 - **Keys:** `Esc` interrupts an in-flight turn, `Ctrl+L` clears the transcript,
   `Ctrl+C` quits.
 
+### LLM visibility and traces
+
+A live phase-aware spinner replaces the generic `Thinking…` indicator. It updates
+through phases such as `Assembling context…`, `Calling LLM…`,
+`Calling recall…`, `Retry 1/2…`, and `Streaming answer…` so you can see why a
+turn is taking time.
+
+Once a turn completes, a collapsed trace block appears under the assistant
+message. It shows a brief summary and can be expanded to reveal the full turn
+lifecycle.
+
+- **Expand/collapse trace:** `Ctrl+O` toggles the trace block for the selected
+  assistant turn.
+- **Navigate turns:** `Ctrl+Up` and `Ctrl+Down` move the selection through the
+  transcript; `Esc` or `Ctrl+Down` past the newest turn returns focus to the
+  prompt.
+- **Trace contents:** every lifecycle event, including tool-call names, full
+  arguments, and full results; per-retry error messages; reasoning/thinking
+  tokens; and raw request/response metadata. Reasoning and raw metadata are
+  hidden while the trace is collapsed and only visible once expanded.
+- **Persistence:** traces are stored in the same SQLite database as memory
+  (`rickshaw_memory.db` by default, or the path passed to `--db-path`) in the
+  `traces` and `trace_events` tables. They survive `/clear` and can be queried
+  outside the TUI.
+
 ### `/settings` — interactive provider/model picker
 
 `/settings` shows current settings then launches an interactive two-step wizard:
