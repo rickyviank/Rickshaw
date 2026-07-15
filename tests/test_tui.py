@@ -21,6 +21,7 @@ from rickshaw.memory.embedder import TFIDFEmbedder
 from rickshaw.history import append_history, default_history_path, load_history
 from rickshaw.memory.service import MemoryService
 from rickshaw.orchestrator import Orchestrator
+from rickshaw import events
 from rickshaw.config import (
     LOCAL_PRESET_NAMES,
     ProviderProfile,
@@ -342,8 +343,13 @@ def test_main_wiring_constructs_orchestrator(mock_config, mock_build):
 
     captured: dict[str, Any] = {}
 
-    def _fake_run(orchestrator, prov, effort, cfg):
-        captured.update(orchestrator=orchestrator, provider=prov, effort=effort)
+    def _fake_run(orchestrator, prov, effort, cfg, trace_store=None):
+        captured.update(
+            orchestrator=orchestrator,
+            provider=prov,
+            effort=effort,
+            trace_store=trace_store,
+        )
 
     with patch("rickshaw.tui._run_app", side_effect=_fake_run):
         tui.main(["--provider", "fake", "--effort", "high", "--db-path", ":memory:"])
@@ -354,6 +360,7 @@ def test_main_wiring_constructs_orchestrator(mock_config, mock_build):
     assert orch.provider is provider
     assert isinstance(orch.memory, MemoryService)
     assert captured["effort"] == Effort.HIGH
+    assert isinstance(captured["trace_store"], tui.TraceStore)
 
 
 @patch("rickshaw.tui._run_app")
@@ -371,8 +378,10 @@ def test_main_validation_failure_falls_back(mock_config, mock_build, mock_run):
     tui.main(["--provider", "fake", "--db-path", ":memory:"])
 
     mock_run.assert_called_once()
-    _, call_provider, _, _ = mock_run.call_args[0]
-    assert call_provider is None
+    args = mock_run.call_args[0]
+    kwargs = mock_run.call_args[1]
+    assert args[1] is None  # provider
+    assert isinstance(kwargs.get("trace_store"), tui.TraceStore)
 
 
 @patch("rickshaw.tui._run_app")
@@ -909,7 +918,7 @@ async def test_app_degraded_turn_shows_themed_banner():
 
     orch, provider, _memory = _make_orchestrator()
     app = tui.make_app(orch, provider, Effort.MEDIUM)
-    orch.run_turn = lambda text, on_delta=None: TurnResult(
+    orch.run_turn = lambda text, on_delta=None, **kwargs: TurnResult(
         text="local answer", degraded=True
     )
 
@@ -952,7 +961,16 @@ async def test_j4_indicator_appears_on_turn_start():
 
         indicator = app.query("#turn-indicator")
         assert len(indicator) > 0
-        assert "Thinking" in str(app.query_one("#turn-indicator").render())
+        indicator_text = str(app.query_one("#turn-indicator").render())
+        assert any(
+            label in indicator_text
+            for label in (
+                "Thinking",
+                "Assembling context",
+                "Building prompt",
+                "Calling LLM",
+            )
+        )
 
         provider.release.set()
         for _ in range(200):
@@ -2455,7 +2473,7 @@ async def test_app_turn_error_connection_shows_server_hint():
     cfg = load_config()
     app = tui.make_app(orch, local, Effort.MEDIUM, cfg=cfg)
 
-    def _boom(text, on_delta=None):
+    def _boom(text, on_delta=None, **kwargs):
         raise httpx.ConnectError("connection refused")
 
     orch.run_turn = _boom
@@ -2484,7 +2502,7 @@ async def test_app_turn_error_timeout_suggests_timeout_setting():
     cfg = load_config()
     app = tui.make_app(orch, local, Effort.MEDIUM, cfg=cfg)
 
-    def _slow(text, on_delta=None):
+    def _slow(text, on_delta=None, **kwargs):
         raise httpx.ReadTimeout("timed out")
 
     orch.run_turn = _slow
@@ -2511,7 +2529,7 @@ async def test_app_turn_error_hosted_has_no_local_hint():
     orch, provider, _memory = _make_orchestrator()
     app = tui.make_app(orch, provider, Effort.MEDIUM)
 
-    def _boom(text, on_delta=None):
+    def _boom(text, on_delta=None, **kwargs):
         raise httpx.ConnectError("connection refused")
 
     orch.run_turn = _boom
@@ -2547,3 +2565,163 @@ def test_main_validate_only_local_failure_prints_hint(mock_build, capsys):
     err = capsys.readouterr().err
     assert "Provider validation failed (llamacpp)" in err
     assert local_server_down_hint("llamacpp") in err
+
+
+# --- LLM visibility / trace block tests -------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trace_block_appears_after_turn():
+    """A collapsed trace block is appended after the assistant turn completes."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hello"
+        await pilot.press("enter")
+
+        for _ in range(100):
+            if not app._turn_active:
+                break
+            await pilot.pause(0.02)
+
+        trace_blocks = app.query(".trace-block")
+        assert len(trace_blocks) == 1
+        summary = str(trace_blocks[0].query_one(".summary").render())
+        assert "events" in summary
+        assert "s" in summary  # duration suffix
+
+
+@pytest.mark.asyncio
+async def test_spinner_text_updates_for_events():
+    """The turn indicator label reflects the latest lifecycle event type."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._turn_active = True
+        app._turn_seq = 1
+        app._first_token = False
+        app._phase_label = "Thinking…"
+        app._live_tokens = 0
+        app._turn_started = 0.0
+
+        cases = [
+            (events.ContextStart(), "Assembling context…"),
+            (events.ContextDone(record_count=2, token_estimate=10), "Assembling context…"),
+            (events.PromptBuilt(message_count=3, token_estimate=20), "Building prompt…"),
+            (events.LLMCallStart(attempt=1, model="fake"), "Calling LLM…"),
+            (events.TurnToolCallStart(call_id="1", tool_name="recall", arguments={}), "Calling tool recall…"),
+            (events.Retry(attempt=1, max_retries=2, delay=1.0, error="boom"), "Retrying LLM call…"),
+            (events.Degraded(reason="Falling back to local memory"), "Degraded — showing local memory…"),
+        ]
+        for event, expected in cases:
+            app._on_turn_event(event, 1)
+            text = app._indicator_text()
+            assert expected in text, f"expected {expected!r} in {text!r}"
+
+        # After the first text delta the indicator should switch to Streaming.
+        app._on_turn_event(events.TurnTextDelta(text="hi"), 1)
+        assert "Streaming…" in app._indicator_text()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_o_expands_and_collapses_trace_block():
+    """Ctrl+O toggles the selected turn's trace block details."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hello"
+        await pilot.press("enter")
+
+        for _ in range(100):
+            if not app._turn_active:
+                break
+            await pilot.pause(0.02)
+
+        trace = app.query_one(".trace-block")
+        assert not trace._expanded
+
+        app.action_toggle_trace()
+        await pilot.pause()
+        assert trace._expanded
+        assert trace.details.display is True
+
+        app.action_toggle_trace()
+        await pilot.pause()
+        assert not trace._expanded
+        assert trace.details.display is False
+
+
+@pytest.mark.asyncio
+async def test_ctrl_up_down_navigates_turns():
+    """Ctrl+Up/Down moves the selection highlight between turns."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        for value in ("first", "second"):
+            app.query_one("#prompt").value = value
+            await pilot.press("enter")
+            for _ in range(100):
+                if not app._turn_active:
+                    break
+                await pilot.pause(0.02)
+
+        assert len(app._turns) == 2
+        assert app._selected_turn_index == -1
+
+        # Ctrl+Up from prompt selects the most recent turn.
+        app.action_prev_turn()
+        assert app._selected_turn_index == 1
+        assert "selected" in app._turns[1]["user"].classes
+        assert "selected" in app._turns[1]["trace"].classes
+
+        # Ctrl+Up again moves to the older turn.
+        app.action_prev_turn()
+        assert app._selected_turn_index == 0
+        assert "selected" not in app._turns[1]["trace"].classes
+        assert "selected" in app._turns[0]["trace"].classes
+
+        # Ctrl+Down moves back to the newer turn and then to the prompt.
+        app.action_next_turn()
+        assert app._selected_turn_index == 1
+        app.action_next_turn()
+        assert app._selected_turn_index == -1
+
+
+@pytest.mark.asyncio
+async def test_trace_events_persisted_to_store(tmp_path):
+    """Turn lifecycle events are written to the provided TraceStore."""
+    pytest.importorskip("textual")
+    db = tmp_path / "trace.db"
+    trace_store = tui.TraceStore(db_path=str(db))
+    provider = _FakeProvider(function_calling=False)
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory, trace_store=trace_store)
+    app = tui.make_app(orch, provider, Effort.MEDIUM, trace_store=trace_store)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hello"
+        await pilot.press("enter")
+
+        for _ in range(100):
+            if not app._turn_active:
+                break
+            await pilot.pause(0.02)
+
+        trace_store.flush(timeout=2.0)
+        turn_id = app._turns[-1]["turn_id"]
+        trace = trace_store.get_trace(turn_id)
+        assert trace is not None
+        event_types = [e["type"] for e in trace["events"]]
+        assert "turn_start" in event_types
+        assert "turn_done" in event_types
+
+    trace_store.close()

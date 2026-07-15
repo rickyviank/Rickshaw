@@ -50,6 +50,9 @@ from rickshaw.providers.build import build_provider_from_profile
 from rickshaw.providers.factory import get_provider
 from rickshaw.prompt.builder import _estimate_tokens
 from rickshaw.settings import load_settings, save_settings
+from rickshaw.trace_store import TraceStore
+
+from rickshaw import events
 
 from rickshaw_ai._builtins import default_providers as _builtin_providers
 from rickshaw_ai.credentials.store import FileCredentialStore
@@ -111,7 +114,7 @@ STATUS_BAR_KEEP_ALWAYS = {"provider", "model", "effort"}
 STATUS_BAR_DROP_ORDER = ("price", "tokens", "context")
 STATUS_BAR_NARROW_WIDTH = 80
 
-_DEFAULT_HINT = "/help  ·  esc interrupt  ·  ^c quit"
+_DEFAULT_HINT = "/help  ·  ^o expand trace  ·  ctrl+up/down navigate  ·  esc interrupt  ·  ^c quit"
 _USER_MARK = "[#e0a86b]›[/]"  # amber angle-quote before each user message
 _PROMPT_GLYPH = "›"
 _ASSISTANT_LABEL = "o--o [dim]rickshaw[/]"
@@ -361,11 +364,15 @@ def make_app(
     provider: LLMProvider | None,
     effort: Effort,
     cfg: RickshawConfig | None = None,
+    trace_store: TraceStore | None = None,
 ):
     """Build the Textual app instance. Imports Textual lazily.
 
     *provider* may be ``None`` when launching without a pre-selected provider.
     The TUI then shows an interactive picker on mount.
+
+    *trace_store* may be provided by the caller (``main()`` uses the persistent
+    database path); otherwise a transient ``:memory:`` store is created.
 
     Kept as a factory (rather than a module-level class) so importing this
     module does not require Textual to be installed.
@@ -375,7 +382,7 @@ def make_app(
         from textual.app import App, ComposeResult
         from textual.binding import Binding
         from textual.css.query import NoMatches
-        from textual.containers import Horizontal, VerticalScroll
+        from textual.containers import Horizontal, Vertical, VerticalScroll
         from textual.message import Message
         from textual.suggester import SuggestFromList
         from textual.widgets import Markdown, Rule, Static, TextArea
@@ -383,6 +390,16 @@ def make_app(
         raise SystemExit(_TEXTUAL_MISSING_MSG) from exc
 
     cfg = cfg or RickshawConfig()
+
+    # Resolve the trace store: explicit arg > orchestrator's store > in-memory.
+    if trace_store is None:
+        trace_store = getattr(orchestrator, "trace_store", None) or getattr(
+            orchestrator, "_trace_store", None
+        )
+    if trace_store is None:
+        trace_store = TraceStore(":memory:")
+    orchestrator.trace_store = trace_store
+    orchestrator._trace_store = trace_store
 
     # ---- Provider-add wizard steps ------------------------------------
 
@@ -422,6 +439,103 @@ def make_app(
                 event.stop()
                 self.insert("\n")
                 return
+
+    class TraceBlock(Vertical):
+        """Collapsible per-turn trace summary/details block."""
+
+        def __init__(
+            self,
+            events: list[events.TurnEvent],
+            turn_id: str,
+            duration: float,
+            status: str,
+        ) -> None:
+            super().__init__(classes="trace-block")
+            self.events = events
+            self.turn_id = turn_id
+            self.duration = duration
+            self.status = status
+            self._expanded = False
+
+        def compose(self) -> ComposeResult:
+            from rich.markup import escape
+
+            summary = Static(escape(self._summary_text()), classes="summary")
+            summary.display = True
+            yield summary
+            details = Static(escape(self._details_text()), classes="details")
+            details.display = False
+            yield details
+
+        def on_mount(self) -> None:
+            self.summary = self.query_one(".summary", Static)
+            self.details = self.query_one(".details", Static)
+
+        def _summary_text(self) -> str:
+            n = len(self.events)
+            tool_calls = sum(
+                1 for e in self.events if isinstance(e, events.TurnToolCallStart)
+            )
+            retries = sum(1 for e in self.events if isinstance(e, events.Retry))
+            degraded = any(isinstance(e, events.Degraded) for e in self.events)
+
+            parts = [f"{n} events"]
+            parts.append(
+                f"{tool_calls} tool call{'s' if tool_calls != 1 else ''}"
+            )
+            if retries:
+                parts.append(
+                    f"{retries} retr{'ies' if retries != 1 else 'y'}"
+                )
+            if degraded:
+                parts.append("degraded")
+            if self.status not in ("completed",):
+                parts.append(self.status)
+            parts.append(f"{self.duration:.1f}s")
+            return " · ".join(parts)
+
+        def _details_text(self) -> str:
+            import json
+
+            lines: list[str] = []
+            lines.append(f"turn: {self.turn_id}")
+            lines.append(f"status: {self.status}")
+            lines.append(f"duration: {self.duration:.2f}s")
+            lines.append("")
+            for ev in self.events:
+                data = ev.model_dump(mode="json")
+                lines.append(f"--- {data.pop('type', ev.type)} ---")
+                for key, value in data.items():
+                    try:
+                        rendered = json.dumps(value, ensure_ascii=False, indent=2)
+                    except TypeError:
+                        rendered = str(value)
+                    lines.append(f"{key}:")
+                    for sub in rendered.splitlines():
+                        lines.append(f"  {sub}")
+                lines.append("")
+            return "\n".join(lines)
+
+        def toggle(self) -> None:
+            from rich.markup import escape
+
+            self._expanded = not self._expanded
+            if self._expanded:
+                self.details.update(escape(self._details_text()))
+                self.details.display = True
+                self.add_class("expanded")
+            else:
+                self.details.display = False
+                self.remove_class("expanded")
+            self.summary.update(escape(self._summary_text()))
+
+        def expand(self) -> None:
+            if not self._expanded:
+                self.toggle()
+
+        def collapse(self) -> None:
+            if self._expanded:
+                self.toggle()
 
     class RickshawTUI(App):
         """Textual application driving turns through the Orchestrator."""
@@ -524,20 +638,49 @@ def make_app(
               color: $rk-meta;
               padding: 0 3;
           }
+          .trace-block {
+              background: $rk-surface;
+              border: round $rk-border;
+              padding: 0 1;
+              margin: 0 0 1 0;
+              height: auto;
+          }
+          .trace-block .summary {
+              color: $rk-meta;
+              height: auto;
+          }
+          .trace-block .details {
+              color: $rk-text;
+              height: auto;
+              display: none;
+          }
+          .trace-block.expanded .details {
+              display: block;
+          }
+          .u.selected {
+              background: #2a2f36;
+          }
+          .trace-block.selected {
+              border: tall $rk-accent;
+          }
         """
 
         BINDINGS = [
             Binding("escape", "interrupt", "Interrupt", show=False),
             Binding("ctrl+l", "clear", "Clear", show=False),
             Binding("ctrl+c", "ctrl_c", "Quit", show=False, priority=True),
+            Binding("ctrl+up", "prev_turn", "Prev turn", show=False),
+            Binding("ctrl+down", "next_turn", "Next turn", show=False),
+            Binding("ctrl+o", "toggle_trace", "Toggle trace", show=False),
         ]
 
-        def __init__(self) -> None:
+        def __init__(self, trace_store: TraceStore | None = None) -> None:
             super().__init__()
             self.orchestrator = orchestrator
             self.provider = provider
             self.effort = effort
             self.cfg = cfg
+            self.trace_store = trace_store
             self.orchestrator.effort = effort
             self._history: list[str] = load_history()
             self._history_pos: int = len(self._history)
@@ -557,6 +700,12 @@ def make_app(
             self._spinner_idx = 0
             self._live_tokens = 0
             self._first_token = False
+            self._phase_label = "Thinking…"
+            self._current_events: list[events.TurnEvent] = []
+            self._current_turn_id: str | None = None
+            self._current_user: Static | None = None
+            self._turns: list[dict] = []
+            self._selected_turn_index = -1
             self._ctrl_c_pending = False
             self._ctrl_c_timer = None
             self._session_tokens = 0
@@ -1970,10 +2119,13 @@ def make_app(
             if self._has_turns:
                 self.query_one("#transcript", VerticalScroll).mount(Rule())
             self._has_turns = True
-            self._write(f"{_USER_MARK} {text}", "u")
+            self._current_user = self._write(f"{_USER_MARK} {text}", "u")
             self._buffer = ""
             self._current_md = None
             self._first_token = False
+            self._phase_label = "Thinking…"
+            self._current_events = []
+            self._current_turn_id = None
             self._live_tokens = 0
             self._spinner_idx = 0
             self._turn_started = time.monotonic()
@@ -1989,7 +2141,10 @@ def make_app(
         def _indicator_text(self) -> str:
             frame = _SPINNER_FRAMES[self._spinner_idx % len(_SPINNER_FRAMES)]
             secs = int(time.monotonic() - self._turn_started)
-            label = "Streaming…" if self._first_token else "Thinking…"
+            if self._first_token:
+                label = "Streaming…"
+            else:
+                label = self._phase_label or "Thinking…"
             return (
                 f"[#e0a86b]{frame}[/] {label} "
                 f"({secs}s · ~{self._live_tokens} tok · esc to interrupt)"
@@ -2022,8 +2177,18 @@ def make_app(
                     return
                 self.call_from_thread(self._append_delta, chunk, seq)
 
+            def on_event(event: events.TurnEvent) -> None:
+                if not self._turn_active or seq != self._turn_seq:
+                    return
+                self.call_from_thread(self._on_turn_event, event, seq)
+
             try:
-                result = self.orchestrator.run_turn(text, on_delta=on_delta)
+                result = self.orchestrator.run_turn(
+                    text,
+                    on_delta=on_delta,
+                    on_event=on_event,
+                    trace_store=self.trace_store,
+                )
             except Exception as exc:  # keep the app alive on unexpected errors
                 self.call_from_thread(self._turn_error, exc, seq)
                 return
@@ -2040,6 +2205,31 @@ def make_app(
                 self._current_md.update(self._buffer)
             self._live_tokens = _estimate_tokens(self._buffer)
             self._scroll_end()
+
+        def _on_turn_event(self, event: events.TurnEvent, seq: int) -> None:
+            if seq != self._turn_seq or not self._turn_active:
+                return
+            self._current_events.append(event)
+            if isinstance(event, events.TurnStart):
+                self._current_turn_id = event.turn_id
+
+            # Map lifecycle events to live spinner labels.
+            if isinstance(event, (events.ContextStart, events.ContextDone)):
+                self._phase_label = "Assembling context…"
+            elif isinstance(event, events.PromptBuilt):
+                self._phase_label = "Building prompt…"
+            elif isinstance(event, events.LLMCallStart):
+                self._phase_label = "Calling LLM…"
+            elif isinstance(event, events.TurnToolCallStart):
+                self._phase_label = f"Calling tool {event.tool_name}…"
+            elif isinstance(event, events.Retry):
+                self._phase_label = "Retrying LLM call…"
+            elif isinstance(event, events.Degraded):
+                self._phase_label = "Degraded — showing local memory…"
+            elif isinstance(event, events.TurnTextDelta):
+                self._first_token = True
+                if self._current_md is None:
+                    self._begin_assistant()
 
         def _turn_done(self, result, seq: int) -> None:
             if seq != self._turn_seq or not self._turn_active:
@@ -2086,6 +2276,7 @@ def make_app(
                         + (usage.completion_tokens or 0) / 1_000_000 * (p.output or 0)
                     )
             self._update_status_bar()
+            self._finalize_trace("completed")
             self._finish_turn()
 
         def _turn_error(self, exc: Exception, seq: int) -> None:
@@ -2099,12 +2290,39 @@ def make_app(
             self._write(
                 f"Error: {exc} — {hint}" if hint else f"Error: {exc}", "warn",
             )
+            self._finalize_trace("failed")
             self._finish_turn()
+
+        def _finalize_trace(self, status: str) -> None:
+            """Mount the per-turn trace block and register the turn for navigation."""
+            if self._current_user is None:
+                return
+            turn_id = self._current_turn_id or ""
+            duration = time.monotonic() - self._turn_started
+            trace = TraceBlock(
+                events=list(self._current_events),
+                turn_id=turn_id,
+                duration=duration,
+                status=status,
+            )
+            self.query_one("#transcript", VerticalScroll).mount(trace)
+            self._turns.append(
+                {
+                    "user": self._current_user,
+                    "trace": trace,
+                    "turn_id": turn_id,
+                }
+            )
+            self._scroll_end()
 
         def _finish_turn(self) -> None:
             self._turn_active = False
             self._stop_indicator()
             self._current_md = None
+            self._current_user = None
+            self._current_events = []
+            self._current_turn_id = None
+            self._phase_label = "Thinking…"
             self._set_hint(_DEFAULT_HINT)
             prompt = self.query_one("#prompt", PromptArea)
             prompt.disabled = False
@@ -2130,9 +2348,10 @@ def make_app(
                 return
             if self._turn_active:
                 self.workers.cancel_group(self, "turn")
-                self._turn_active = False
                 self._stop_indicator()
                 self._write("(interrupted)", "warn")
+                self._finalize_trace("interrupted")
+                self._turn_active = False
                 self._finish_turn()
                 return
             if self._menu_open:
@@ -2165,13 +2384,54 @@ def make_app(
         def action_clear(self) -> None:
             self.query_one("#transcript", VerticalScroll).remove_children()
             self._has_turns = False
+            self._turns = []
+            self._selected_turn_index = -1
             self.call_after_refresh(self._finish_clear)
 
         def _finish_clear(self) -> None:
             self._render_welcome()
             self._write("cleared.", "meta")
 
-    return RickshawTUI()
+        def _set_selected_turn(self, index: int) -> None:
+            old = self._selected_turn_index
+            if old >= 0 and old < len(self._turns):
+                self._turns[old]["user"].remove_class("selected")
+                self._turns[old]["trace"].remove_class("selected")
+            self._selected_turn_index = index
+            if index >= 0 and index < len(self._turns):
+                self._turns[index]["user"].add_class("selected")
+                self._turns[index]["trace"].add_class("selected")
+                self._turns[index]["trace"].scroll_visible()
+
+        def action_prev_turn(self) -> None:
+            if not self._turns:
+                return
+            if self._selected_turn_index == -1:
+                new = len(self._turns) - 1
+            else:
+                new = max(0, self._selected_turn_index - 1)
+            self._set_selected_turn(new)
+
+        def action_next_turn(self) -> None:
+            if not self._turns:
+                return
+            if self._selected_turn_index == -1:
+                return
+            new = self._selected_turn_index + 1
+            if new >= len(self._turns):
+                self._set_selected_turn(-1)
+                self.query_one("#prompt", PromptArea).focus()
+            else:
+                self._set_selected_turn(new)
+
+        def action_toggle_trace(self) -> None:
+            if not self._turns:
+                return
+            if self._selected_turn_index == -1:
+                self._set_selected_turn(len(self._turns) - 1)
+            self._turns[self._selected_turn_index]["trace"].toggle()
+
+    return RickshawTUI(trace_store=trace_store)
 
 
 def _run_app(
@@ -2179,9 +2439,10 @@ def _run_app(
     provider: LLMProvider | None,
     effort: Effort,
     cfg: RickshawConfig,
+    trace_store: TraceStore | None = None,
 ) -> None:
     """Build and run the Textual app (separated out for testability)."""
-    make_app(orchestrator, provider, effort, cfg).run()
+    make_app(orchestrator, provider, effort, cfg, trace_store=trace_store).run()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -2270,9 +2531,15 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     memory = MemoryService(db_path=args.db_path)
-    orchestrator = Orchestrator(provider=provider, memory=memory, effort=effort)  # type: ignore[arg-type]
+    trace_store = TraceStore(db_path=args.db_path)
+    orchestrator = Orchestrator(
+        provider=provider,
+        memory=memory,
+        effort=effort,
+        trace_store=trace_store,
+    )  # type: ignore[arg-type]
 
-    _run_app(orchestrator, provider, effort, cfg)
+    _run_app(orchestrator, provider, effort, cfg, trace_store=trace_store)
 
 
 if __name__ == "__main__":

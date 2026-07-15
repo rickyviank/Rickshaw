@@ -12,3 +12,5 @@ build/
 # Runtime artifacts
 rickshaw_memory.db
 *.sqlite3
+file:*
+uv.lock

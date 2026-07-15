@@ -9,8 +9,9 @@ contract.
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Iterator
 
+from rickshaw.events import StreamEvent
 from rickshaw.providers import _bridge
 from rickshaw.providers.base import (
     Capabilities,
@@ -134,7 +135,24 @@ class AnthropicProvider(LLMProvider):
             result, effort=effort, tool_calls=tool_calls, fallback_model=self._model
         )
 
-    # stream() is inherited from LLMProvider — falls back to complete().
+    def stream_events(
+        self,
+        messages: list[Message],
+        effort: Effort = Effort.MEDIUM,
+        tools: list[ToolSpec] | None = None,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> Iterator[StreamEvent]:
+        req = _bridge.GenerateRequest(
+            messages=_bridge.to_ai_messages(messages),
+            tools=_bridge.to_ai_tools(tools),
+            tool_choice=tool_choice if tools else None,
+            reasoning=_bridge.Reasoning(effort=_EFFORT_MAP[effort]),
+            provider_options=dict(kwargs),
+        )
+        yield from _bridge.stream_events(
+            self._provider_info(), self._model_info(), self._api_key, req
+        )
 
     @staticmethod
     def _static_models() -> list[str]:

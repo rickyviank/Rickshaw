@@ -10,6 +10,7 @@ import pytest
 import respx
 
 from rickshaw.config import ProviderProfile, is_local_url
+from rickshaw import events as ev
 from rickshaw.providers import _bridge
 from rickshaw.providers.base import Effort, Message, Response, ToolCall, ToolSpec
 from rickshaw.providers.openai_provider import OpenAIProvider
@@ -560,6 +561,71 @@ def test_openai_stream_applies_profile_timeout():
     assert captured == [httpx.Timeout(300)]
 
 
+@respx.mock
+def test_openai_stream_events_yields_text_and_done():
+    """stream_events() yields TextDelta chunks followed by StreamDone."""
+    sse = "".join(
+        f"data: {json.dumps(chunk)}\n\n"
+        for chunk in [
+            {"choices": [{"index": 0, "delta": {"content": "Hello "}}]},
+            {"choices": [{"index": 0, "delta": {"content": "world"}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ]
+    ) + "data: [DONE]\n\n"
+    respx.post("https://api.openai.com/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200, text=sse, headers={"content-type": "text/event-stream"}
+        )
+    )
+
+    provider = OpenAIProvider(api_key="sk-test")
+    events = list(provider.stream_events([Message(role="user", content="Hi")]))
+
+    assert len(events) == 3
+    assert isinstance(events[0], ev.TextDelta) and events[0].text == "Hello "
+    assert isinstance(events[1], ev.TextDelta) and events[1].text == "world"
+    assert isinstance(events[2], ev.StreamDone)
+    assert events[2].model == "gpt-4o"
+
+
+@respx.mock
+def test_openai_stream_events_forwards_tools_and_tool_choice():
+    """stream_events() includes tools and tool_choice in the request payload."""
+    sse = (
+        "data: "
+        + json.dumps(
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        )
+        + "\n\ndata: [DONE]\n\n"
+    )
+    route = respx.post("https://api.openai.com/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200, text=sse, headers={"content-type": "text/event-stream"}
+        )
+    )
+
+    provider = OpenAIProvider(api_key="sk-test")
+    tools = [
+        ToolSpec(
+            name="recall",
+            description="Recall memories",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+        )
+    ]
+    list(
+        provider.stream_events(
+            [Message(role="user", content="hi")],
+            tools=tools,
+            tool_choice="required",
+        )
+    )
+
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["tool_choice"] == "required"
+    assert sent["tools"][0]["type"] == "function"
+    assert sent["tools"][0]["function"]["name"] == "recall"
+
+
 # ---------------------------------------------------------------------------
 # Devin provider
 # ---------------------------------------------------------------------------
@@ -993,6 +1059,105 @@ def test_anthropic_available_models():
 def test_anthropic_name():
     provider = AnthropicProvider(api_key="sk-ant-test")
     assert provider.name == "anthropic"
+
+
+def _anthropic_sse(events: list[dict]) -> httpx.Response:
+    body = "".join(
+        f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events
+    )
+    return httpx.Response(
+        200, text=body, headers={"content-type": "text/event-stream"}
+    )
+
+
+@respx.mock
+def test_anthropic_stream_events_yields_text_and_done():
+    """stream_events() yields TextDelta chunks followed by StreamDone."""
+    sse_events = [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 5}}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "Hello "},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "world"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 6},
+        },
+        {"type": "message_stop"},
+    ]
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=_anthropic_sse(sse_events)
+    )
+
+    provider = AnthropicProvider(api_key="sk-ant-test")
+    events = list(provider.stream_events([Message(role="user", content="Hi")]))
+
+    assert len(events) == 3
+    assert isinstance(events[0], ev.TextDelta) and events[0].text == "Hello "
+    assert isinstance(events[1], ev.TextDelta) and events[1].text == "world"
+    assert isinstance(events[2], ev.StreamDone)
+    assert events[2].model == "claude-3-5-sonnet-latest"
+
+
+@respx.mock
+def test_anthropic_stream_events_forwards_tools_and_tool_choice():
+    """stream_events() includes tools and maps tool_choice to Anthropic shape."""
+    sse_events = [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 5}}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "Hi"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ]
+    route = respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=_anthropic_sse(sse_events)
+    )
+
+    provider = AnthropicProvider(api_key="sk-ant-test")
+    tools = [
+        ToolSpec(
+            name="recall",
+            description="Recall memories",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+        )
+    ]
+    list(
+        provider.stream_events(
+            [Message(role="user", content="hi")],
+            tools=tools,
+            tool_choice="required",
+        )
+    )
+
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["tool_choice"] == {"type": "any"}
+    assert sent["tools"][0]["name"] == "recall"
 
 
 # ---------------------------------------------------------------------------
