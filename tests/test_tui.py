@@ -42,6 +42,7 @@ from rickshaw.providers.base import (
 
 import rickshaw.tui as tui
 from rickshaw.settings import load_settings, save_settings
+from rickshaw.trace_render import TraceLine, TraceView
 
 
 class _FakeProvider(LLMProvider):
@@ -2589,8 +2590,20 @@ async def test_trace_block_appears_after_turn():
         trace_blocks = app.query(".trace-block")
         assert len(trace_blocks) == 1
         summary = str(trace_blocks[0].query_one(".summary").render())
-        assert "events" in summary
+        assert "steps" in summary
         assert "s" in summary  # duration suffix
+
+        # Expanded details contain the grouped answer block.
+        app.action_toggle_trace()
+        await pilot.pause()
+        line_texts = "\n".join(str(line.render()) for line in trace_blocks[0]._line_widgets)
+        assert "answer" in line_texts.lower()
+        answer_content = "\n".join(
+            str(line._content_widget.render())
+            for line in trace_blocks[0]._line_widgets
+            if line._content_widget is not None
+        )
+        assert "Hello from fake" in answer_content
 
 
 @pytest.mark.asyncio
@@ -2651,6 +2664,16 @@ async def test_ctrl_o_expands_and_collapses_trace_block():
         await pilot.pause()
         assert trace._expanded
         assert trace.details.display is True
+        # Details are rendered as a list of per-line widgets.
+        assert len(trace._line_widgets) > 0
+        line_texts = "\n".join(str(line.render()) for line in trace._line_widgets)
+        assert "answer" in line_texts.lower()
+        answer_content = "\n".join(
+            str(line._content_widget.render())
+            for line in trace._line_widgets
+            if line._content_widget is not None
+        )
+        assert "Hello from fake" in answer_content
 
         app.action_toggle_trace()
         await pilot.pause()
@@ -2725,3 +2748,215 @@ async def test_trace_events_persisted_to_store(tmp_path):
         assert "turn_done" in event_types
 
     trace_store.close()
+
+
+@pytest.mark.asyncio
+async def test_trace_r_raw_toggle():
+    """Pressing ``r`` on a focused trace line toggles raw JSON for the block."""
+    pytest.importorskip("textual")
+
+    def _mock_format(event_records, **kwargs):
+        return TraceView(
+            summary="1 step · 0 tool calls · 0 retries · completed · 0.0s",
+            header_lines=["hello · completed · 0.00s", "fake/fake-model"],
+            lines=[
+                TraceLine(
+                    timestamp="+0.10s",
+                    label="tool",
+                    summary="recall(query)",
+                    raw_json='{"type": "tool_call_done"}',
+                    expandable=True,
+                    color_class="trace-tool",
+                )
+            ],
+            step_count=1,
+        )
+
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+    with patch("rickshaw.tui.format_trace", side_effect=_mock_format):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "hello"
+            await pilot.press("enter")
+            for _ in range(100):
+                if not app._turn_active:
+                    break
+                await pilot.pause(0.02)
+
+            trace = app.query_one(".trace-block")
+            app.action_toggle_trace()
+            await pilot.pause()
+            line = trace._line_widgets[0]
+            line.focus()
+            await pilot.pause()
+
+            rendered = str(line.render())
+            assert "recall(query)" in rendered
+
+            await pilot.press("r")
+            await pilot.pause()
+            rendered = str(line.render())
+            assert '"type": "tool_call_done"' in rendered
+
+            await pilot.press("r")
+            await pilot.pause()
+            rendered = str(line.render())
+            assert "recall(query)" in rendered
+
+
+@pytest.mark.asyncio
+async def test_trace_per_event_expand():
+    """Enter on a focused trace line expands/collapses its raw payload."""
+    pytest.importorskip("textual")
+
+    def _mock_format(event_records, **kwargs):
+        return TraceView(
+            summary="1 step · 0 tool calls · 0 retries · completed · 0.0s",
+            header_lines=["hello · completed · 0.00s", "fake/fake-model"],
+            lines=[
+                TraceLine(
+                    timestamp="+0.10s",
+                    label="tool",
+                    summary="recall(query)",
+                    raw_json='{"type": "tool_call_done"}',
+                    expandable=True,
+                    color_class="trace-tool",
+                )
+            ],
+            step_count=1,
+        )
+
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+    with patch("rickshaw.tui.format_trace", side_effect=_mock_format):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "hello"
+            await pilot.press("enter")
+            for _ in range(100):
+                if not app._turn_active:
+                    break
+                await pilot.pause(0.02)
+
+            trace = app.query_one(".trace-block")
+            app.action_toggle_trace()
+            await pilot.pause()
+            line = trace._line_widgets[0]
+            line.focus()
+            await pilot.pause()
+
+            assert not line._expanded
+            await pilot.press("enter")
+            await pilot.pause()
+            assert line._expanded
+            assert line._content_widget is not None
+            assert line._content_widget.display is True
+            assert '"type": "tool_call_done"' in str(line._content_widget.render())
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not line._expanded
+            assert line._content_widget.display is False
+
+
+@pytest.mark.asyncio
+async def test_trace_grouped_answer_and_thinking():
+    """Grouped answer and thinking blocks render with their merged content."""
+    pytest.importorskip("textual")
+
+    def _mock_format(event_records, **kwargs):
+        return TraceView(
+            summary="2 steps · 0 tool calls · 0 retries · completed · 0.0s",
+            header_lines=["hello · completed · 0.00s", "fake/fake-model"],
+            lines=[
+                TraceLine(
+                    timestamp="+0.10s",
+                    label="thinking",
+                    summary="(2 Δ)",
+                    content="step one\nstep two",
+                    expandable=True,
+                    color_class="trace-thinking",
+                ),
+                TraceLine(
+                    timestamp="+0.20s",
+                    label="answer",
+                    summary="(1 Δ)",
+                    content="final answer",
+                    expandable=True,
+                    color_class="trace-answer",
+                ),
+            ],
+            step_count=2,
+        )
+
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+    with patch("rickshaw.tui.format_trace", side_effect=_mock_format):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "hello"
+            await pilot.press("enter")
+            for _ in range(100):
+                if not app._turn_active:
+                    break
+                await pilot.pause(0.02)
+
+            trace = app.query_one(".trace-block")
+            app.action_toggle_trace()
+            await pilot.pause()
+            line_texts = "\n".join(str(line.render()) for line in trace._line_widgets)
+            assert "thinking" in line_texts.lower()
+            assert "answer" in line_texts.lower()
+            content_text = "\n".join(
+                str(line._content_widget.render())
+                for line in trace._line_widgets
+                if line._content_widget is not None
+            )
+            assert "final answer" in content_text
+            assert "step one" in content_text
+
+
+@pytest.mark.asyncio
+async def test_trace_contextual_hint():
+    """The bottom hint updates when a trace line has focus."""
+    pytest.importorskip("textual")
+
+    def _mock_format(event_records, **kwargs):
+        return TraceView(
+            summary="1 step · 0 tool calls · 0 retries · completed · 0.0s",
+            header_lines=["hello · completed · 0.00s", "fake/fake-model"],
+            lines=[
+                TraceLine(
+                    timestamp="+0.10s",
+                    label="answer",
+                    summary="(1 Δ)",
+                    content="hi",
+                    expandable=True,
+                    color_class="trace-answer",
+                )
+            ],
+            step_count=1,
+        )
+
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+    with patch("rickshaw.tui.format_trace", side_effect=_mock_format):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "hello"
+            await pilot.press("enter")
+            for _ in range(100):
+                if not app._turn_active:
+                    break
+                await pilot.pause(0.02)
+
+            trace = app.query_one(".trace-block")
+            app.action_toggle_trace()
+            await pilot.pause()
+            trace._line_widgets[0].focus()
+            await pilot.pause()
+
+            hint_text = str(app.query_one("#hint").render())
+            assert tui._TRACE_HINT in hint_text
+
+            await pilot.press("escape")
+            await pilot.pause()
+            hint_text = str(app.query_one("#hint").render())
+            assert tui._DEFAULT_HINT in hint_text
