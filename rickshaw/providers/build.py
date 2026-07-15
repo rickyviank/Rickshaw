@@ -42,6 +42,7 @@ def build_provider_from_profile(
             base_url=profile.base_url,
             model=profile.model,
             embedding_model=embedding_model or None,
+            timeout=profile.timeout,
         )
 
     if profile.wire_format == "anthropic":

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Iterator
 
+import httpx
 import pytest
 
 from rickshaw.memory.embedder import TFIDFEmbedder
@@ -21,6 +22,7 @@ from rickshaw.providers.base import (
     ToolSpec,
 )
 from rickshaw.queue import JobQueue
+from rickshaw_ai.errors import ConnectionError as RAIConnectionError
 
 
 class _FakeProvider(LLMProvider):
@@ -262,3 +264,204 @@ def test_read_only_tools_exempt_from_round_limit():
 
     # Read-only calls bypass max_tool_rounds; bounded only by the hard cap.
     assert len(provider.call_log) == _HARD_ITERATION_CAP + 1
+
+
+class _EndpointProvider(_FakeProvider):
+    """Fake provider that always raises *exc*, optionally pinned to a base URL."""
+
+    def __init__(
+        self, exc: Exception, base_url: str | None = None, **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._exc = exc
+        if base_url is not None:
+            self._base_url = base_url
+
+    def complete(
+        self,
+        messages: list[Message],
+        effort: Effort = Effort.MEDIUM,
+        tools: list[ToolSpec] | None = None,
+        **kwargs: Any,
+    ) -> Response:
+        self._call_count += 1
+        self.call_log.append({"call_number": self._call_count})
+        raise self._exc
+
+
+class _StreamingEndpointProvider(_EndpointProvider):
+    """Streaming-capable variant whose stream() raises *exc*."""
+
+    def stream(
+        self,
+        messages: list[Message],
+        effort: Effort = Effort.MEDIUM,
+        tools: list[ToolSpec] | None = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        self._call_count += 1
+        self.call_log.append({"call_number": self._call_count})
+        raise self._exc
+        yield ""  # unreachable; makes this a generator like the base class
+
+    def capabilities(self) -> Capabilities:
+        return Capabilities(
+            streaming=True,
+            function_calling=False,
+            max_context_tokens=4096,
+        )
+
+
+class _ToolThenFailProvider(_FakeProvider):
+    """Returns a tool call on the first call, then raises *exc*."""
+
+    def __init__(self, exc: Exception, base_url: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._exc = exc
+        self._base_url = base_url
+
+    def complete(
+        self,
+        messages: list[Message],
+        effort: Effort = Effort.MEDIUM,
+        tools: list[ToolSpec] | None = None,
+        **kwargs: Any,
+    ) -> Response:
+        self._call_count += 1
+        self.call_log.append({"call_number": self._call_count})
+        if self._call_count == 1:
+            return Response(
+                text="",
+                model="fake",
+                effort=effort,
+                tool_calls=[
+                    ToolCall(id="tc1", name="remember", arguments={"fact": "x"})
+                ],
+            )
+        raise self._exc
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        RAIConnectionError("All connection attempts failed"),
+        httpx.ConnectError("[Errno 61] Connection refused"),
+        httpx.ConnectTimeout("timed out"),
+        ConnectionError("connection refused"),
+    ],
+)
+def test_local_connection_error_fails_fast(monkeypatch, original):
+    """Connection errors against a local endpoint: one attempt, no backoff."""
+    provider = _EndpointProvider(original, base_url="http://localhost:8080/v1")
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory, queue=JobQueue())
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("rickshaw.orchestrator.time.sleep", sleeps.append)
+
+    with pytest.raises(ConnectionError) as excinfo:
+        orch.run_turn("hello")
+
+    assert "http://localhost:8080/v1" in str(excinfo.value)
+    assert excinfo.value.__cause__ is original
+    assert len(provider.call_log) == 1
+    assert sleeps == []
+
+
+def test_local_connection_error_with_url_not_rewrapped():
+    """An error that already names the base URL propagates unwrapped."""
+    original = ConnectionError(
+        "Could not reach local inference server at http://localhost:8080/v1"
+    )
+    provider = _EndpointProvider(original, base_url="http://localhost:8080/v1")
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory, queue=JobQueue())
+
+    with pytest.raises(ConnectionError) as excinfo:
+        orch.run_turn("hello")
+
+    assert excinfo.value is original
+    assert len(provider.call_log) == 1
+
+
+def test_hosted_connection_error_keeps_retries():
+    """Hosted endpoints keep the existing retry/backoff-then-degrade behavior."""
+    provider = _EndpointProvider(
+        httpx.ConnectError("connection refused"),
+        base_url="https://api.example.com/v1",
+    )
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(
+        provider=provider, memory=memory, queue=JobQueue(), retry_backoff=0,
+    )
+
+    result = orch.run_turn("What do you know?")
+
+    assert result.degraded is True
+    assert len(provider.call_log) == orch.max_retries + 1
+
+
+def test_local_non_connection_error_still_retried():
+    """Fail-fast applies only to connection errors; others retry as before."""
+    provider = _EndpointProvider(
+        TimeoutError("read timed out"), base_url="http://localhost:8080/v1",
+    )
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(
+        provider=provider, memory=memory, queue=JobQueue(), retry_backoff=0,
+    )
+
+    result = orch.run_turn("What do you know?")
+
+    assert result.degraded is True
+    assert len(provider.call_log) == orch.max_retries + 1
+
+
+def test_provider_without_base_url_unchanged():
+    """Providers lacking ``_base_url`` keep the existing retry behavior."""
+    provider = _EndpointProvider(httpx.ConnectError("connection refused"))
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(
+        provider=provider, memory=memory, queue=JobQueue(), retry_backoff=0,
+    )
+
+    result = orch.run_turn("What do you know?")
+
+    assert result.degraded is True
+    assert len(provider.call_log) == orch.max_retries + 1
+
+
+def test_streaming_local_connection_error_fails_fast(monkeypatch):
+    """Streaming turns also fail fast on local connection errors."""
+    original = RAIConnectionError("All connection attempts failed")
+    provider = _StreamingEndpointProvider(
+        original, base_url="http://localhost:1234/v1",
+    )
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory, queue=JobQueue())
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("rickshaw.orchestrator.time.sleep", sleeps.append)
+
+    with pytest.raises(ConnectionError) as excinfo:
+        orch.run_turn("hello", on_delta=lambda _chunk: None)
+
+    assert "http://localhost:1234/v1" in str(excinfo.value)
+    assert len(provider.call_log) == 1
+    assert sleeps == []
+
+
+def test_tool_followup_local_connection_error_fails_fast():
+    """A local connection error on the follow-up call also fails the turn."""
+    original = RAIConnectionError("All connection attempts failed")
+    provider = _ToolThenFailProvider(
+        original, base_url="http://localhost:11434/v1", function_calling=True,
+    )
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory, queue=JobQueue())
+
+    with pytest.raises(ConnectionError) as excinfo:
+        orch.run_turn("Remember something")
+
+    assert "http://localhost:11434/v1" in str(excinfo.value)
+    assert len(provider.call_log) == 2

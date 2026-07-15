@@ -49,6 +49,8 @@ is needed for the terminal UI.
 | `ANTHROPIC_BASE_URL` | No | Override the Anthropic API base URL (default: `https://api.anthropic.com`). |
 | `ANTHROPIC_MODEL` | No | Claude model to use (default: `claude-3-5-sonnet-latest`). |
 | `RICKSHAW_EMBEDDING_PROVIDER` | No | Separate embedding provider (e.g. `openai`) independent of the chat provider. |
+| `LLAMACPP_BASE_URL` etc. | No | Base-URL overrides for the local presets (`MLX_BASE_URL`, `OLLAMA_BASE_URL`, `LMSTUDIO_BASE_URL`). |
+| `LLAMACPP_API_KEY` etc. | No | Optional keys for local servers that enforce one (sent when set, never required). |
 
 You may also supply values in a `config.yaml` file in the working directory.
 
@@ -57,6 +59,46 @@ You may also supply values in a `config.yaml` file in the working directory.
 - **openai** — OpenAI chat completions and embeddings APIs.
 - **devin** — Devin coding agent API (skeleton; fill in TODOs from Devin API docs).
 - **anthropic** — Anthropic Claude Messages API (chat + tool-calling; no embeddings).
+- **llamacpp / mlx / ollama / lmstudio** — locally-hosted OpenAI-compatible
+  servers (see [Local providers](#local-providers-llamacpp-mlx-lm-ollama-lm-studio)).
+
+### Local providers (llama.cpp, MLX-LM, Ollama, LM Studio)
+
+Four built-in presets connect to locally-hosted OpenAI-compatible servers — no
+API key required:
+
+| Preset | Default base URL | Server |
+|---|---|---|
+| `llamacpp` | `http://localhost:8080/v1` | llama.cpp `llama-server` |
+| `mlx` | `http://localhost:8080/v1` | `mlx_lm.server` |
+| `ollama` | `http://localhost:11434/v1` | Ollama |
+| `lmstudio` | `http://localhost:1234/v1` | LM Studio local server |
+
+```bash
+llama-server -m model.gguf   # start your server, then:
+rickshaw --provider llamacpp
+```
+
+- **Keyless by default** — validation checks that the server is reachable and
+  lists at least one model (`GET /v1/models`) instead of requiring a key. If
+  your server does use one (e.g. `llama-server --api-key`), set the preset's
+  env var (`LLAMACPP_API_KEY`, `MLX_API_KEY`, `OLLAMA_API_KEY`,
+  `LMSTUDIO_API_KEY`) and it will be sent.
+- **Model resolution** — with no model configured, the server's `/v1/models` is
+  queried on activation: a single model is selected automatically; several
+  models open the interactive picker.
+- **Non-default ports** — override with `LLAMACPP_BASE_URL`, `MLX_BASE_URL`,
+  `OLLAMA_BASE_URL`, `LMSTUDIO_BASE_URL`, or a `providers.<name>.base_url`
+  entry in `~/.rickshaw/settings.json`.
+- **Fail-fast errors** — a stopped server fails immediately with an actionable
+  hint (no retry/backoff) instead of generic retries.
+- **Effort levels** are not applicable to local servers; `reasoning_effort` is
+  never sent and a one-time note is shown instead of repeated warnings.
+- **Timeouts** — generation defaults to 120s everywhere; raise it per provider
+  with `providers.<name>.timeout` (seconds) in settings for big/cold models
+  (applies to openai-wire profiles, which includes all local presets).
+- Note: `llamacpp` and `mlx` share port 8080 — the preset name is a label;
+  whichever compatible server is listening will be used.
 
 Adding a new provider: subclass `rickshaw.providers.base.LLMProvider`, implement the abstract methods, and register it:
 
@@ -190,7 +232,8 @@ created with defaults on first launch.  Schema:
       "base_url": "https://api.deepseek.com/v1",
       "model": "deepseek-chat",
       "api_key_env": "DEEPSEEK_API_KEY",
-      "wire_format": "openai"
+      "wire_format": "openai",
+      "timeout": 300
     }
   }
 }

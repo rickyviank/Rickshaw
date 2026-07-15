@@ -54,6 +54,9 @@ class ProviderInfo(BaseModel):
     base_url: str
     protocol: Protocol
     auth_methods: list[AuthMethod] = Field(default_factory=lambda: ["api_key"])
+    #: When False, requests may go out unauthenticated if no credential is
+    #: stored and no env key is set (e.g. keyless local servers).
+    requires_auth: bool = True
     #: Env vars checked as a fallback (in order) when nothing is stored.
     env_keys: list[str] = Field(default_factory=list)
     #: Header name for an API key. Bearer-style providers use Authorization.

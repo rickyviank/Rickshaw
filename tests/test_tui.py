@@ -21,7 +21,15 @@ from rickshaw.memory.embedder import TFIDFEmbedder
 from rickshaw.history import append_history, default_history_path, load_history
 from rickshaw.memory.service import MemoryService
 from rickshaw.orchestrator import Orchestrator
-from rickshaw.config import ProviderProfile, RickshawConfig, _parse_status_bar, load_config
+from rickshaw.config import (
+    LOCAL_PRESET_NAMES,
+    ProviderProfile,
+    RickshawConfig,
+    _parse_status_bar,
+    load_config,
+    local_no_models_hint,
+    local_server_down_hint,
+)
 from rickshaw.providers.base import (
     Capabilities,
     Effort,
@@ -1975,3 +1983,567 @@ async def test_app_status_no_provider():
                 for w in app.query_one("#transcript").query("Static")
             )
             assert "(none)" in rendered
+
+
+# --- Local provider support (PRD: local-providers) ---------------------------
+
+
+class _LocalProvider(_FakeProvider):
+    """Fake local OpenAI-compatible provider — never hits the network."""
+
+    def __init__(
+        self,
+        models: list[str] | None = None,
+        base_url: str = "http://localhost:8080/v1",
+    ) -> None:
+        super().__init__(function_calling=False)
+        self._base_url = base_url
+        self._model = ""
+        self._models = list(models or [])
+
+    def available_models(self) -> list[str]:
+        return list(self._models)
+
+
+class _DownLocalProvider(_LocalProvider):
+    """Fake local provider whose server is unreachable."""
+
+    def validate(self) -> None:
+        raise ValueError(
+            f"llamacpp unreachable at {self._base_url} — connection refused"
+        )
+
+    def available_models(self) -> list[str]:
+        raise ConnectionError(
+            f"Could not reach local inference server at {self._base_url}: refused"
+        )
+
+
+def _transcript_text(app) -> str:
+    return " ".join(
+        str(w.render()) for w in app.query_one("#transcript").query("Static")
+    )
+
+
+def test_local_hint_message_appends_no_models_hint():
+    profile = ProviderProfile(
+        base_url="http://localhost:8080/v1", model="",
+        api_key_env="LLAMACPP_API_KEY", wire_format="openai",
+    )
+    exc = ValueError("llamacpp at http://localhost:8080/v1 lists no models")
+    msg = tui._local_hint_message("llamacpp", profile, exc)
+    assert str(exc) in msg
+    assert msg.endswith(local_no_models_hint("llamacpp"))
+
+
+def test_local_hint_message_server_down_without_duplicating_url():
+    profile = ProviderProfile(
+        base_url="http://localhost:8080/v1", model="",
+        api_key_env="LLAMACPP_API_KEY", wire_format="openai",
+    )
+    exc = ValueError("llamacpp unreachable at http://localhost:8080/v1")
+    msg = tui._local_hint_message("llamacpp", profile, exc)
+    assert msg.endswith(local_server_down_hint("llamacpp"))
+    assert msg.count("http://localhost:8080/v1") == 1
+
+
+def test_local_hint_message_adds_url_when_missing():
+    profile = ProviderProfile(
+        base_url="http://localhost:11434/v1", model="",
+        api_key_env="OLLAMA_API_KEY", wire_format="openai",
+    )
+    exc = ConnectionError("connection refused")
+    msg = tui._local_hint_message("ollama", profile, exc)
+    assert "ollama unreachable at http://localhost:11434/v1" in msg
+    assert msg.endswith(local_server_down_hint("ollama"))
+
+
+def test_local_hint_message_hosted_unchanged():
+    profile = ProviderProfile(
+        base_url="https://api.openai.com/v1", model="gpt-4o",
+        api_key_env="OPENAI_API_KEY", wire_format="openai",
+    )
+    exc = ConnectionError("connection refused")
+    assert tui._local_hint_message("openai", profile, exc) == str(exc)
+    assert tui._local_hint_message("openai", None, exc) == str(exc)
+
+
+def test_local_turn_hint_timeout_suggests_profile_timeout():
+    hint = tui._local_turn_hint("llamacpp", httpx.ReadTimeout("timed out"))
+    assert hint == (
+        "increase providers.llamacpp.timeout in ~/.rickshaw/settings.json"
+    )
+
+
+def test_local_turn_hint_connection_suggests_server_check():
+    assert tui._local_turn_hint(
+        "llamacpp", httpx.ConnectError("connection refused")
+    ) == local_server_down_hint("llamacpp")
+    assert tui._local_turn_hint(
+        "llamacpp", httpx.ConnectTimeout("timed out")
+    ) == local_server_down_hint("llamacpp")
+    assert tui._local_turn_hint("llamacpp", ValueError("weird")) == ""
+
+
+def test_local_presets_appear_in_config_providers():
+    cfg = load_config()
+    for name in LOCAL_PRESET_NAMES:
+        assert name in cfg.providers
+        assert cfg.providers[name].is_local_endpoint()
+
+
+@pytest.mark.asyncio
+async def test_app_launch_picker_lists_local_presets():
+    """J1: the on-launch picker offers the local presets."""
+    pytest.importorskip("textual")
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=None, memory=memory)
+    cfg = load_config()
+    app = tui.make_app(orch, None, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        rendered = _transcript_text(app)
+        assert "Pick a provider" in rendered
+        for name in LOCAL_PRESET_NAMES:
+            assert name in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_provider_list_includes_local_presets():
+    """``/provider`` lists the local presets alongside hosted ones."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = load_config()
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/provider"
+        await pilot.press("enter")
+        await pilot.pause()
+        rendered = _transcript_text(app)
+        assert "available providers" in rendered
+        for name in LOCAL_PRESET_NAMES:
+            assert name in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_provider_switch_local_auto_selects_single_model():
+    """J1: /provider llamacpp with one served model adopts it silently."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = load_config()
+    local = _LocalProvider(models=["qwen2.5-7b"])
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=local):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/provider llamacpp"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            assert "model · qwen2.5-7b" in rendered
+            assert "llamacpp · qwen2.5-7b" in rendered
+            assert app.provider is local
+            assert local._model == "qwen2.5-7b"
+            assert "llamacpp" in _statusbar_text(app)
+
+    s = load_settings()
+    assert s["provider"] == "llamacpp"
+    entry = s["providers"]["llamacpp"]
+    assert entry["model"] == "qwen2.5-7b"
+    assert entry["base_url"] == "http://localhost:8080/v1"
+    assert entry["api_key_env"] == "LLAMACPP_API_KEY"
+    assert entry["wire_format"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_app_provider_switch_local_multi_model_routes_to_picker():
+    """J3: several installed models route through the /settings model picker."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = load_config()
+    local = _LocalProvider(models=["m-a", "m-b"], base_url="http://localhost:11434/v1")
+    applied = _LocalProvider(models=["m-a", "m-b"], base_url="http://localhost:11434/v1")
+    applied._model = "m-b"
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=local), \
+         patch("rickshaw.tui._rebuild_provider", return_value=applied):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/provider ollama"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            assert "Pick a model" in rendered
+            assert "m-a" in rendered
+            assert "m-b" in rendered
+            # Not switched yet: the picker applies the choice.
+            assert app.provider is provider
+
+            app.query_one("#prompt").value = "m-b"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            assert "ollama · m-b" in rendered
+            assert app.provider is applied
+
+    s = load_settings()
+    assert s["provider"] == "ollama"
+    assert s["providers"]["ollama"]["model"] == "m-b"
+
+
+@pytest.mark.asyncio
+async def test_app_provider_switch_local_missing_model_falls_back():
+    """J9: a persisted model that vanished is re-resolved (note + auto-select)."""
+    pytest.importorskip("textual")
+    s = load_settings()
+    s.setdefault("providers", {})["llamacpp"] = {
+        "base_url": "http://localhost:8080/v1",
+        "model": "old.gguf",
+        "timeout": 300,
+    }
+    save_settings(s)
+    orch, provider, _memory = _make_orchestrator()
+    cfg = load_config()
+    assert cfg.providers["llamacpp"].model == "old.gguf"
+    local = _LocalProvider(models=["new.gguf"])
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=local):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/provider llamacpp"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            assert "'old.gguf' is no longer available" in rendered
+            assert "model · new.gguf" in rendered
+            assert app.provider is local
+
+    entry = load_settings()["providers"]["llamacpp"]
+    assert entry["model"] == "new.gguf"
+    # Pre-existing keys of the entry are preserved.
+    assert entry["timeout"] == 300
+    assert entry["base_url"] == "http://localhost:8080/v1"
+
+
+@pytest.mark.asyncio
+async def test_app_provider_switch_local_server_down_keeps_previous():
+    """J5: a down server fails the switch with a hint; previous provider stays."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = load_config()
+    down = _DownLocalProvider()
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=down):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/provider llamacpp"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            assert "Cannot switch provider" in rendered
+            assert local_server_down_hint("llamacpp") in rendered
+            assert app.provider is provider
+            assert orch.provider is provider
+
+    assert load_settings()["provider"] != "llamacpp"
+
+
+@pytest.mark.asyncio
+async def test_app_local_effort_note_shown_once():
+    """J4: entering a local provider notes effort once; effort is untouched."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    orch.effort = Effort.HIGH
+    cfg = load_config()
+    local = _LocalProvider(models=["m1"], base_url="http://localhost:1234/v1")
+    app = tui.make_app(orch, provider, Effort.HIGH, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=local):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/provider lmstudio"
+            await pilot.press("enter")
+            await pilot.pause()
+            app.query_one("#prompt").value = "/provider lmstudio"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            note = (
+                "effort is not applicable to local provider lmstudio "
+                "— using provider defaults"
+            )
+            assert rendered.count(note) == 1
+            assert orch.effort == Effort.HIGH
+            assert "Reset to medium" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_hosted_effort_reset_warning_unchanged():
+    """Hosted providers keep the effort-reset warning on every switch."""
+    pytest.importorskip("textual")
+
+    class _NoHighProvider(_FakeProvider):
+        def capabilities(self):
+            return Capabilities(
+                streaming=True,
+                function_calling=False,
+                effort_levels=[Effort.LOW, Effort.MEDIUM],
+                max_context_tokens=4096,
+            )
+
+    orch, provider, _memory = _make_orchestrator()
+    orch.effort = Effort.HIGH
+    cfg = RickshawConfig()
+    cfg.providers["hosted"] = ProviderProfile(
+        base_url="https://api.example.com/v1", model="m",
+        api_key_env="HOSTED_KEY", wire_format="openai",
+    )
+    hosted = _NoHighProvider()
+    app = tui.make_app(orch, provider, Effort.HIGH, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=hosted):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/provider hosted"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert orch.effort == Effort.MEDIUM
+            orch.effort = Effort.HIGH
+            app.query_one("#prompt").value = "/provider hosted"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            assert rendered.count(
+                "note: hosted does not support effort high. Reset to medium."
+            ) == 2
+            assert "effort is not applicable" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_settings_flow_local_auto_selects_single_model():
+    """J1: the on-launch picker auto-selects a lone local model and persists."""
+    pytest.importorskip("textual")
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=None, memory=memory)
+    cfg = load_config()
+    local = _LocalProvider(models=["solo-model"])
+    applied = _LocalProvider(models=["solo-model"])
+    applied._model = "solo-model"
+    app = tui.make_app(orch, None, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=local), \
+         patch("rickshaw.tui._rebuild_provider", return_value=applied):
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "Pick a provider" in _transcript_text(app)
+
+            app.query_one("#prompt").value = "llamacpp"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            assert "Pick a model" not in rendered
+            assert "model: solo-model" in rendered
+            assert "llamacpp · solo-model" in rendered
+            assert app.provider is applied
+            assert app._settings_state is None
+            assert "llamacpp" in _statusbar_text(app)
+
+    s = load_settings()
+    assert s["provider"] == "llamacpp"
+    assert s["providers"]["llamacpp"]["model"] == "solo-model"
+
+
+@pytest.mark.asyncio
+async def test_app_settings_flow_local_no_models_shows_hint():
+    """An empty local model list aborts the picker with the per-server hint."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = load_config()
+    local = _LocalProvider(models=[])
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=local):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/settings"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            app.query_one("#prompt").value = "llamacpp"
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            assert "No models available for llamacpp" in rendered
+            assert local_no_models_hint("llamacpp") in rendered
+            assert app._settings_state is None
+            assert app.provider is provider
+
+
+@pytest.mark.asyncio
+async def test_app_provider_add_wizard_optional_key_for_local_url():
+    """J7: the api_key_env step is skippable when the base URL is local."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/provider add"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        for val in ["myllama", "http://localhost:9090/v1"]:
+            prompt.value = val
+            await pilot.press("enter")
+            await pilot.pause()
+
+        hint = str(app.query_one("#hint").render())
+        assert "optional for local — Enter to skip" in hint
+
+        for val in ["", ""]:
+            prompt.value = val
+            await pilot.press("enter")
+            await pilot.pause()
+
+        assert "myllama" in cfg.providers
+        p = cfg.providers["myllama"]
+        assert p.base_url == "http://localhost:9090/v1"
+        assert p.api_key_env == ""
+        assert p.wire_format == "openai"
+        assert "provider registered" in _transcript_text(app)
+
+    assert load_settings()["providers"]["myllama"]["api_key_env"] == ""
+
+
+@pytest.mark.asyncio
+async def test_app_provider_add_wizard_requires_key_for_hosted_url():
+    """Hosted base URLs still require an api_key_env in the wizard."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/provider add"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        for val in ["hostedeng", "https://api.example.com/v1"]:
+            prompt.value = val
+            await pilot.press("enter")
+            await pilot.pause()
+
+        hint = str(app.query_one("#hint").render())
+        assert "optional for local" not in hint
+
+        prompt.value = ""
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "api_key_env is required." in _transcript_text(app)
+        assert "hostedeng" not in cfg.providers
+
+
+@pytest.mark.asyncio
+async def test_app_turn_error_connection_shows_server_hint():
+    """J6: a connection error on a turn carries the local server hint."""
+    pytest.importorskip("textual")
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    local = _LocalProvider(models=["m1"])
+    local._model = "m1"
+    orch = Orchestrator(provider=local, memory=memory)
+    cfg = load_config()
+    app = tui.make_app(orch, local, Effort.MEDIUM, cfg=cfg)
+
+    def _boom(text, on_delta=None):
+        raise httpx.ConnectError("connection refused")
+
+    orch.run_turn = _boom
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+
+        rendered = ""
+        for _ in range(100):
+            rendered = _transcript_text(app)
+            if "Error:" in rendered:
+                break
+            await pilot.pause(0.05)
+        assert "connection refused" in rendered
+        assert local_server_down_hint("llamacpp") in rendered
+
+
+@pytest.mark.asyncio
+async def test_app_turn_error_timeout_suggests_timeout_setting():
+    """J10: a generation timeout suggests raising the per-profile timeout."""
+    pytest.importorskip("textual")
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    local = _LocalProvider(models=["m1"])
+    local._model = "m1"
+    orch = Orchestrator(provider=local, memory=memory)
+    cfg = load_config()
+    app = tui.make_app(orch, local, Effort.MEDIUM, cfg=cfg)
+
+    def _slow(text, on_delta=None):
+        raise httpx.ReadTimeout("timed out")
+
+    orch.run_turn = _slow
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+
+        rendered = ""
+        for _ in range(100):
+            rendered = _transcript_text(app)
+            if "Error:" in rendered:
+                break
+            await pilot.pause(0.05)
+        assert (
+            "increase providers.llamacpp.timeout in ~/.rickshaw/settings.json"
+            in rendered
+        )
+
+
+@pytest.mark.asyncio
+async def test_app_turn_error_hosted_has_no_local_hint():
+    """Hosted turn failures render exactly as before."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    def _boom(text, on_delta=None):
+        raise httpx.ConnectError("connection refused")
+
+    orch.run_turn = _boom
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+
+        rendered = ""
+        for _ in range(100):
+            rendered = _transcript_text(app)
+            if "Error:" in rendered:
+                break
+            await pilot.pause(0.05)
+        assert "Error: connection refused" in rendered
+        assert "running?" not in rendered
+
+
+@patch("rickshaw.tui._build_provider")
+def test_main_validate_only_local_failure_prints_hint(mock_build, capsys):
+    """--validate-only against a down local server exits 1 with the hint."""
+    provider = _FakeProvider()
+    provider.validate = MagicMock(side_effect=ValueError(
+        "llamacpp unreachable at http://localhost:8080/v1 — connection refused"
+    ))
+    mock_build.return_value = provider
+
+    with pytest.raises(SystemExit) as excinfo:
+        tui.main(
+            ["--provider", "llamacpp", "--validate-only", "--db-path", ":memory:"]
+        )
+
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "Provider validation failed (llamacpp)" in err
+    assert local_server_down_hint("llamacpp") in err

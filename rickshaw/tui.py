@@ -35,7 +35,13 @@ from urllib.parse import quote, urlencode
 import httpx
 
 from rickshaw.cli import _EFFORT_NAMES, _build_provider, load_config
-from rickshaw.config import ProviderProfile, RickshawConfig
+from rickshaw.config import (
+    ProviderProfile,
+    RickshawConfig,
+    is_local_url,
+    local_no_models_hint,
+    local_server_down_hint,
+)
 from rickshaw.memory.service import MemoryService
 from rickshaw.history import append_history, load_history
 from rickshaw.orchestrator import Orchestrator
@@ -227,6 +233,7 @@ def _rebuild_provider(name: str, cfg: RickshawConfig, model: str) -> LLMProvider
             model=model,
             api_key_env=profile.api_key_env,
             wire_format=profile.wire_format,
+            timeout=profile.timeout,
         )
         return build_provider_from_profile(
             name, overridden, embedding_model=cfg.openai_embedding_model,
@@ -255,6 +262,51 @@ def _find_model_info(provider_id: str, model: str):
                 if m.model == model:
                     return m
     return None
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    """Whether *exc* looks like a failure to reach the endpoint at all."""
+    if isinstance(exc, (httpx.TransportError, ConnectionError)):
+        return True
+    msg = str(exc).lower()
+    return "unreachable" in msg or "connect" in msg or "refused" in msg
+
+
+def _local_hint_message(
+    name: str, profile: ProviderProfile | None, exc: Exception
+) -> str:
+    """Return ``str(exc)`` with an actionable hint appended for local endpoints.
+
+    "no models" failures get the per-server model hint; connection failures get
+    the "is <server> running?" hint (PRD local-providers §2.2/§2.5). The base
+    URL is added when the underlying message doesn't already include it.
+    Non-local profiles pass through unchanged.
+    """
+    message = str(exc)
+    if profile is None or not profile.is_local_endpoint():
+        return message
+    if "no models" in message.lower():
+        return f"{message} — {local_no_models_hint(name)}"
+    if _is_connection_error(exc):
+        hint = local_server_down_hint(name)
+        if profile.base_url and profile.base_url not in message:
+            return f"{message} — {name} unreachable at {profile.base_url} — {hint}"
+        return f"{message} — {hint}"
+    return message
+
+
+def _local_turn_hint(name: str, exc: Exception) -> str:
+    """Actionable suffix for a failed turn against a local endpoint (J6/J10)."""
+    msg = str(exc).lower()
+    if not isinstance(exc, httpx.ConnectTimeout) and (
+        isinstance(exc, httpx.TimeoutException)
+        or "timed out" in msg
+        or "timeout" in msg
+    ):
+        return f"increase providers.{name}.timeout in ~/.rickshaw/settings.json"
+    if _is_connection_error(exc):
+        return local_server_down_hint(name)
+    return ""
 
 
 def _oauth_quirk(provider_id: str) -> dict[str, object]:
@@ -496,6 +548,8 @@ def make_app(
             self._provider_add_state: dict | None = None
             self._settings_state: dict | None = None
             self._login_state: dict | None = None
+            self._active_profile_name: str | None = None
+            self._effort_note_shown: set[str] = set()
             self._turn_seq = 0
             self._indicator: Static | None = None
             self._indicator_timer = None
@@ -613,7 +667,9 @@ def make_app(
                 return
             self._write("", "meta")
             self._write("  Pick a provider (enter name, Esc to cancel):", "meta")
-            current = self.provider.name if self.provider else ""
+            current = (
+                self._active_profile_name or self.provider.name
+            ) if self.provider else ""
             for name in all_names:
                 info = _builtin_provider_info(name)
                 oauth_tag = ""
@@ -700,7 +756,9 @@ def make_app(
             info = self._active_model_info()
             return _status_segment_value(
                 name,
-                provider=self.provider.name if self.provider else None,
+                provider=(
+                    self._active_profile_name or self.provider.name
+                ) if self.provider else None,
                 model=getattr(self.provider, "_model", "") or (
                     self.provider.name if self.provider else None
                 ),
@@ -1067,6 +1125,28 @@ def make_app(
                 "meta",
             )
 
+        def _active_local_profile(self) -> tuple[str, ProviderProfile] | None:
+            """Return ``(name, profile)`` when the active provider is local."""
+            if self.provider is None:
+                return None
+            base_url = (getattr(self.provider, "_base_url", "") or "").rstrip("/")
+            if not is_local_url(base_url):
+                return None
+            names = [self._active_profile_name] if self._active_profile_name else []
+            names += sorted(self.cfg.providers)
+            for name in names:
+                profile = self.cfg.providers.get(name)
+                if profile is not None and profile.base_url.rstrip("/") == base_url:
+                    return name, profile
+            return None
+
+        def _exc_with_local_hint(self, exc: Exception) -> str:
+            """Failure text for the active provider, hint-enriched when local."""
+            local = self._active_local_profile()
+            if local is None:
+                return str(exc)
+            return _local_hint_message(local[0], local[1], exc)
+
         def _cmd_effort(self, arg: str) -> None:
             level = arg.lower()
             if level not in _EFFORT_NAMES:
@@ -1103,7 +1183,10 @@ def make_app(
                     models = self.provider.available_models()
                 except Exception as exc:
                     logger.exception("Failed to list models for /model")
-                    self._write(f"Cannot list models: {exc}", "warn")
+                    self._write(
+                        f"Cannot list models: {self._exc_with_local_hint(exc)}",
+                        "warn",
+                    )
                     return
                 self._write("  available models:", "meta")
                 for m in models:
@@ -1116,7 +1199,10 @@ def make_app(
                 valid_models = self.provider.available_models()
             except Exception as exc:
                 logger.exception("Failed to validate model %r", arg)
-                self._write(f"Cannot validate model: {exc}", "warn")
+                self._write(
+                    f"Cannot validate model: {self._exc_with_local_hint(exc)}",
+                    "warn",
+                )
                 return
 
             if arg not in valid_models:
@@ -1183,7 +1269,10 @@ def make_app(
                 models = self.provider.available_models()
             except Exception as exc:
                 logger.exception("Failed to list models for /models")
-                self._write(f"Cannot list models: {exc}", "warn")
+                self._write(
+                    f"Cannot list models: {self._exc_with_local_hint(exc)}",
+                    "warn",
+                )
                 return
             self._write("  available models:", "meta")
             for m in models:
@@ -1261,34 +1350,52 @@ def make_app(
                         chosen, profile,
                         embedding_model=self.cfg.openai_embedding_model,
                     )
+                    if profile.is_local_endpoint():
+                        temp.validate()
                     models = temp.available_models()
                 except Exception as exc:
                     logger.exception("Failed to list models for provider %r", chosen)
-                    self._write(f"Cannot list models for {chosen}: {exc}", "warn")
+                    self._write(
+                        f"Cannot list models for {chosen}: "
+                        f"{_local_hint_message(chosen, profile, exc)}",
+                        "warn",
+                    )
                     self._settings_state = None
                     self._set_hint(_DEFAULT_HINT)
                     return
 
                 if not models:
-                    self._write(f"No models available for {chosen}.", "warn")
+                    msg = f"No models available for {chosen}."
+                    if profile.is_local_endpoint():
+                        msg = f"{msg} — {local_no_models_hint(chosen)}"
+                    self._write(msg, "warn")
                     self._settings_state = None
                     self._set_hint(_DEFAULT_HINT)
                     return
 
+                # Local model resolution (D4): re-verify the persisted model
+                # and adopt silently when the server offers exactly one.
+                if profile.is_local_endpoint():
+                    if profile.model and profile.model not in models:
+                        self._write(
+                            f"model {profile.model!r} is no longer available "
+                            f"on {chosen}",
+                            "meta",
+                        )
+                    if len(models) == 1:
+                        self._write(f"  model: {models[0]}", "meta")
+                        self._settings_apply(chosen, models[0])
+                        self._settings_state = None
+                        self._set_hint(_DEFAULT_HINT)
+                        return
+
                 current_model = (
                     getattr(self.provider, "_model", "")
-                    if self.provider and chosen == self.provider.name
+                    if self.provider
+                    and chosen == (self._active_profile_name or self.provider.name)
                     else ""
                 )
-                self._write("", "meta")
-                self._write("  Pick a model (enter name, Esc to cancel):", "meta")
-                for m in models:
-                    marker = "\u2666" if m == current_model else " "
-                    self._write(f"    {m:<32} {marker}", "meta")
-                state["step"] = "model"
-                state["chosen_provider"] = chosen
-                state["valid_models"] = models
-                self._set_hint("model name (Enter to submit, Esc to cancel)")
+                self._start_model_picker(chosen, models, current_model)
 
             elif state["step"] == "model":
                 if not value:
@@ -1313,6 +1420,22 @@ def make_app(
                 self._settings_state = None
                 self._set_hint(_DEFAULT_HINT)
 
+        def _start_model_picker(
+            self, chosen: str, models: list[str], current_model: str,
+        ) -> None:
+            """Show the model-picker step (shared by /settings and /provider)."""
+            self._write("", "meta")
+            self._write("  Pick a model (enter name, Esc to cancel):", "meta")
+            for m in models:
+                marker = "\u2666" if m == current_model else " "
+                self._write(f"    {m:<32} {marker}", "meta")
+            self._settings_state = {
+                "step": "model",
+                "chosen_provider": chosen,
+                "valid_models": models,
+            }
+            self._set_hint("model name (Enter to submit, Esc to cancel)")
+
         def _settings_apply(self, provider_name: str, model_name: str) -> None:
             """Apply provider + model selection from /settings wizard."""
             profile = self.cfg.providers[provider_name]
@@ -1322,15 +1445,21 @@ def make_app(
                 )
             except Exception as exc:
                 logger.exception("Failed to switch provider/model via /settings")
-                self._write(f"Cannot switch: {exc}", "warn")
+                self._write(
+                    f"Cannot switch: {_local_hint_message(provider_name, profile, exc)}",
+                    "warn",
+                )
                 return
             self.provider = new_provider
             self.orchestrator.provider = new_provider
+            self._active_profile_name = provider_name
 
             # Effort reconciliation.
             caps = new_provider.capabilities()
             old_effort = self.orchestrator.effort
-            if caps.effort_levels and old_effort not in caps.effort_levels:
+            if profile.is_local_endpoint():
+                self._note_local_effort(provider_name)
+            elif caps.effort_levels and old_effort not in caps.effort_levels:
                 default_effort = Effort.MEDIUM
                 self.orchestrator.effort = default_effort
                 self.effort = default_effort
@@ -1340,6 +1469,8 @@ def make_app(
                     "warn",
                 )
 
+            if profile.is_local_endpoint():
+                self._persist_local_model(provider_name, model_name)
             settings = load_settings()
             settings["provider"] = provider_name
             settings["model"] = model_name
@@ -1370,15 +1501,16 @@ def make_app(
 
         def _cmd_provider_list(self) -> None:
             """List available providers with the active one marked."""
+            active = self._active_profile_name or self.provider.name
             model = getattr(self.provider, "_model", "") or self.provider.name
             self._write(
-                f"current \u00b7 {self.provider.name} ({model})", "meta",
+                f"current \u00b7 {active} ({model})", "meta",
             )
             self._write("", "meta")
             self._write("  available providers:", "meta")
             for name in sorted(self.cfg.providers):
                 profile = self.cfg.providers[name]
-                marker = "\u2666" if name == self.provider.name else " "
+                marker = "\u2666" if name == active else " "
                 self._write(
                     f"    {name:<16} {marker} {profile.api_key_env}", "meta",
                 )
@@ -1404,15 +1536,26 @@ def make_app(
                 )
             except Exception as exc:
                 logger.exception("Failed to switch provider to %r", name)
-                self._write(f"Cannot switch provider: {exc}", "warn")
+                self._write(
+                    f"Cannot switch provider: "
+                    f"{_local_hint_message(name, profile, exc)}",
+                    "warn",
+                )
+                return
+            if profile.is_local_endpoint() and not self._resolve_local_model(
+                name, profile, new_provider,
+            ):
                 return
             self.provider = new_provider
             self.orchestrator.provider = new_provider
+            self._active_profile_name = name
 
             # Effort mismatch: reset to medium if unsupported.
             caps = new_provider.capabilities()
             old_effort = self.orchestrator.effort
-            if caps.effort_levels and old_effort not in caps.effort_levels:
+            if profile.is_local_endpoint():
+                self._note_local_effort(name)
+            elif caps.effort_levels and old_effort not in caps.effort_levels:
                 default_effort = Effort.MEDIUM
                 self.orchestrator.effort = default_effort
                 self.effort = default_effort
@@ -1440,6 +1583,79 @@ def make_app(
             )
             self._update_status_bar()
 
+        def _note_local_effort(self, name: str) -> None:
+            """One-time quiet note: effort is a no-op for local providers (D5)."""
+            if name in self._effort_note_shown:
+                return
+            self._effort_note_shown.add(name)
+            self._write(
+                f"effort is not applicable to local provider {name} "
+                f"— using provider defaults",
+                "meta",
+            )
+
+        def _resolve_local_model(
+            self, name: str, profile: ProviderProfile, provider: LLMProvider,
+        ) -> bool:
+            """Resolve the model for a local endpoint before committing (D4).
+
+            Returns ``True`` when *provider* is ready to activate. Returns
+            ``False`` when activation failed (the previous provider stays
+            active) or when the choice was handed to the model picker, which
+            applies the switch itself.
+            """
+            try:
+                provider.validate()
+                models = provider.available_models()
+            except Exception as exc:
+                logger.exception("Failed to activate local provider %r", name)
+                self._write(
+                    f"Cannot switch provider: "
+                    f"{_local_hint_message(name, profile, exc)}",
+                    "warn",
+                )
+                return False
+            if profile.model and profile.model in models:
+                return True
+            if profile.model:
+                self._write(
+                    f"model {profile.model!r} is no longer available on {name}",
+                    "meta",
+                )
+            if not models:
+                self._write(
+                    f"Cannot switch provider: {name} lists no models — "
+                    f"{local_no_models_hint(name)}",
+                    "warn",
+                )
+                return False
+            if len(models) == 1:
+                provider._model = models[0]
+                self._persist_local_model(name, models[0])
+                self._write(f"model · {models[0]}", "meta")
+                return True
+            self._start_model_picker(name, models, "")
+            return False
+
+        def _persist_local_model(self, name: str, model: str) -> None:
+            """Persist the resolved model for a local provider profile."""
+            profile = self.cfg.providers[name]
+            self.cfg.providers[name] = ProviderProfile(
+                base_url=profile.base_url,
+                model=model,
+                api_key_env=profile.api_key_env,
+                wire_format=profile.wire_format,
+                timeout=profile.timeout,
+            )
+            settings = load_settings()
+            entry = settings.setdefault("providers", {}).setdefault(name, {
+                "base_url": profile.base_url,
+                "api_key_env": profile.api_key_env,
+                "wire_format": profile.wire_format,
+            })
+            entry["model"] = model
+            save_settings(settings)
+
         def _cmd_provider_add_start(self) -> None:
             """Begin the interactive provider-registration wizard."""
             self._close_menu()
@@ -1459,8 +1675,13 @@ def make_app(
             if key == "wire_format" and not value:
                 value = "openai"
 
+            # api_key_env is optional when the base URL is local (J7).
+            key_optional = key == "api_key_env" and is_local_url(
+                state["data"].get("base_url", "")
+            )
+
             # Validate required fields.
-            if not value and key != "wire_format":
+            if not value and key != "wire_format" and not key_optional:
                 self._write(f"{key} is required.", "warn")
                 self._write(_PROVIDER_ADD_STEPS[step_idx][1], "meta")
                 return
@@ -1474,8 +1695,15 @@ def make_app(
             state["step"] = step_idx
 
             if step_idx < len(_PROVIDER_ADD_STEPS):
-                _next_key, next_prompt = _PROVIDER_ADD_STEPS[step_idx]
-                self._set_hint(f"{next_prompt}(Enter to submit, Esc to cancel)")
+                next_key, next_prompt = _PROVIDER_ADD_STEPS[step_idx]
+                if next_key == "api_key_env" and is_local_url(
+                    state["data"].get("base_url", "")
+                ):
+                    self._set_hint(
+                        f"{next_prompt}(optional for local — Enter to skip)"
+                    )
+                else:
+                    self._set_hint(f"{next_prompt}(Enter to submit, Esc to cancel)")
             else:
                 self._provider_add_finish(state["data"])
 
@@ -1702,6 +1930,7 @@ def make_app(
 
             self.provider = new_provider
             self.orchestrator.provider = new_provider
+            self._active_profile_name = provider_id
 
             settings = load_settings()
             settings["provider"] = provider_id
@@ -1863,7 +2092,13 @@ def make_app(
             if seq != self._turn_seq or not self._turn_active:
                 return
             self._stop_indicator()
-            self._write(f"Error: {exc}", "warn")
+            hint = ""
+            local = self._active_local_profile()
+            if local is not None:
+                hint = _local_turn_hint(local[0], exc)
+            self._write(
+                f"Error: {exc} — {hint}" if hint else f"Error: {exc}", "warn",
+            )
             self._finish_turn()
 
         def _finish_turn(self) -> None:
@@ -1989,9 +2224,12 @@ def main(argv: list[str] | None = None) -> None:
             provider = _build_provider(provider_name, cfg)
             provider.validate()
         except Exception as exc:
+            exc_msg = _local_hint_message(
+                provider_name, cfg.providers.get(provider_name), exc,
+            )
             if args.validate_only:
                 print(
-                    f"Provider validation failed ({provider_name}): {exc}",
+                    f"Provider validation failed ({provider_name}): {exc_msg}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -2001,13 +2239,13 @@ def main(argv: list[str] | None = None) -> None:
                     save_settings(settings)
                 else:
                     print(
-                        f"Could not use provider {provider_name!r}: {exc}. "
+                        f"Could not use provider {provider_name!r}: {exc_msg}. "
                         "Launching provider picker.",
                         file=sys.stderr,
                     )
             elif args.allow_unvalidated:
                 print(
-                    f"Provider validation failed ({provider_name}): {exc}",
+                    f"Provider validation failed ({provider_name}): {exc_msg}",
                     file=sys.stderr,
                 )
                 print(
@@ -2016,7 +2254,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
             else:
                 print(
-                    f"Could not use provider {provider_name!r}: {exc}. "
+                    f"Could not use provider {provider_name!r}: {exc_msg}. "
                     "Launching provider picker.",
                     file=sys.stderr,
                 )
