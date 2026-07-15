@@ -115,8 +115,8 @@ STATUS_BAR_KEEP_ALWAYS = {"provider", "model", "effort"}
 STATUS_BAR_DROP_ORDER = ("price", "tokens", "context")
 STATUS_BAR_NARROW_WIDTH = 80
 
-_DEFAULT_HINT = "/help  ·  ^o expand trace  ·  ctrl+up/down navigate  ·  esc interrupt  ·  ^c quit"
-_TRACE_HINT = "r raw  ·  tab expand event  ·  esc return to prompt"
+_DEFAULT_HINT = "/help  ·  ^o expand trace  ·  tab focus trace  ·  ctrl+up/down navigate  ·  esc interrupt  ·  ^c quit"
+_TRACE_HINT = "up/down navigate  ·  enter expand/collapse  ·  r raw  ·  esc return to prompt"
 
 # Map formatter color class names to Textual markup styles.
 _TRACE_STYLE_MAP = {
@@ -2675,9 +2675,18 @@ def make_app(
         def action_toggle_trace(self) -> None:
             if not self._turns:
                 return
-            if self._selected_turn_index == -1:
-                self._set_selected_turn(len(self._turns) - 1)
-            self._turns[self._selected_turn_index]["trace"].toggle()
+            focused = self.focused
+            if isinstance(focused, TraceLineWidget):
+                trace = focused.trace_block
+                for index, turn in enumerate(self._turns):
+                    if turn["trace"] is trace:
+                        self._set_selected_turn(index)
+                        break
+            else:
+                if self._selected_turn_index == -1:
+                    self._set_selected_turn(len(self._turns) - 1)
+                trace = self._turns[self._selected_turn_index]["trace"]
+            trace.toggle()
 
         def action_toggle_trace_raw(self) -> None:
             focused = self.focused

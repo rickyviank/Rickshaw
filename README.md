@@ -179,9 +179,11 @@ lifecycle.
 - **Navigate turns:** `Ctrl+Up` and `Ctrl+Down` move the selection through the
   transcript; `Esc` or `Ctrl+Down` past the newest turn returns focus to the
   prompt.
-- **Navigate inside an expanded trace:** press `Tab` to move focus into the
-  trace, then use the arrow keys to move between events. Press `Enter` on an
-  event to expand it and reveal its raw JSON; press `Enter` again to collapse.
+- **Navigate inside an expanded trace:** press `Tab` from the prompt to move
+  focus into the selected trace, then use `Up`/`Down` to move between events.
+  Press `Enter` on an event to expand or collapse its full payload; for
+  non-delta events this shows the raw JSON, and for answer/thinking blocks it
+  shows the generated content.
 - **Human-readable view:** expanded traces render as a chronological list of
   grouped `[answer]` and `[thinking]` blocks (or `[partial answer]` /
   `[partial thinking]` when a turn is interrupted) with bracket-label summaries
