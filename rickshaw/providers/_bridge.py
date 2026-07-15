@@ -18,6 +18,7 @@ from typing import Any, AsyncIterator, Callable, Iterator
 
 import httpx
 
+from rickshaw.config import is_local_url
 from rickshaw.providers.base import (
     Effort,
     Message,
@@ -35,6 +36,7 @@ from rickshaw_ai import TextBlock, Tool
 from rickshaw_ai.credentials import ApiKeyCredential
 from rickshaw_ai.credentials.store import CredentialStore, FileCredentialStore
 from rickshaw_ai.credentials.types import Credential
+from rickshaw_ai.factory import _new_http
 from rickshaw_ai.providers import ProviderRuntime, adapter_for
 from rickshaw_ai.registry import ModelInfo, ProviderInfo, RetryPolicy
 from rickshaw_ai.streaming import StreamDone, TextDelta
@@ -165,30 +167,39 @@ def _enrich(provider: ProviderInfo) -> ProviderInfo:
 class _ResolveStore(CredentialStore):
     def __init__(
         self,
-        file_store: FileCredentialStore,
+        file_store: FileCredentialStore | None,
         seed: dict[str, Credential] | None = None,
     ) -> None:
         self._file = file_store
         self._seed = seed
 
     async def read(self, provider_id: str) -> Credential | None:
-        cred = await self._file.read(provider_id)
-        if cred is not None:
-            return cred
+        if self._file is not None:
+            cred = await self._file.read(provider_id)
+            if cred is not None:
+                return cred
         if self._seed is not None:
             return self._seed.get(provider_id)
         return None
 
     async def modify(self, provider_id: str, fn):
+        if self._file is None:
+            raise RuntimeError(f"no file credential store for {provider_id!r}")
         return await self._file.modify(provider_id, fn)
 
     async def delete(self, provider_id: str) -> None:
-        await self._file.delete(provider_id)
+        if self._file is not None:
+            await self._file.delete(provider_id)
 
 
 def _runtime(provider: ProviderInfo, api_key: str, http: httpx.AsyncClient) -> ProviderRuntime:
-    provider = _enrich(provider)
-    file_store = FileCredentialStore(credential_store_path())
+    # Local endpoints skip builtin enrichment (no OAuth/env-key fallbacks) and
+    # never read the file store, so hosted credentials stored under the same
+    # provider id are not sent to a local server.
+    local = is_local_url(provider.base_url)
+    if not local:
+        provider = _enrich(provider)
+    file_store = None if local else FileCredentialStore(credential_store_path())
     seed = {provider.id: ApiKeyCredential(key=api_key)} if api_key else None
     store = _ResolveStore(file_store, seed)
     return ProviderRuntime(
@@ -211,21 +222,29 @@ def has_stored_credential(provider_id: str) -> bool:
 
 
 def generate(
-    provider: ProviderInfo, model: ModelInfo, api_key: str, req: GenerateRequest
+    provider: ProviderInfo,
+    model: ModelInfo,
+    api_key: str,
+    req: GenerateRequest,
+    timeout: float | None = None,
 ) -> GenerateResult:
     async def _run() -> GenerateResult:
-        async with httpx.AsyncClient(timeout=120) as http:
+        async with _new_http(None, timeout) as http:
             return await _runtime(provider, api_key, http).generate(req, model)
 
     return run_sync(_run())
 
 
 def stream_text(
-    provider: ProviderInfo, model: ModelInfo, api_key: str, req: GenerateRequest
+    provider: ProviderInfo,
+    model: ModelInfo,
+    api_key: str,
+    req: GenerateRequest,
+    timeout: float | None = None,
 ) -> Iterator[str]:
     def _factory() -> AsyncIterator:
         async def _agen():
-            async with httpx.AsyncClient(timeout=120) as http:
+            async with _new_http(None, timeout) as http:
                 async for event in _runtime(provider, api_key, http).stream(req, model):
                     yield event
 

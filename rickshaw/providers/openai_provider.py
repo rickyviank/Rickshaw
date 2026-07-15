@@ -51,25 +51,31 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
         base_url: str | None = None,
         model: str | None = None,
         embedding_model: str | None = None,
+        timeout: float | None = None,
     ) -> None:
-        self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self._base_url = (
             base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
         ).rstrip("/")
+        # OPENAI_API_KEY is the hosted OpenAI key — never a fallback for
+        # local endpoints (their profile key env var arrives via *api_key*).
+        if not api_key and not is_local_url(self._base_url):
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+        self._api_key = api_key or ""
         self._model = model or os.environ.get("OPENAI_MODEL", "gpt-4o")
         self._embedding_model = embedding_model or os.environ.get(
             "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
         )
+        self._timeout = timeout
 
     @property
     def name(self) -> str:
         return "openai"
 
     def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
 
     # -- rickshaw_ai wiring ------------------------------------------------
 
@@ -80,6 +86,7 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
             protocol="openai",
             api_key_header="Authorization",
             api_key_prefix="Bearer ",
+            requires_auth=not is_local_url(self._base_url),
         )
 
     def _model_info(self) -> ModelInfo:
@@ -148,7 +155,11 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
             provider_options=dict(kwargs),
         )
         result = _bridge.generate(
-            self._provider_info(), self._model_info(), self._api_key, req
+            self._provider_info(),
+            self._model_info(),
+            self._api_key,
+            req,
+            timeout=self._timeout,
         )
         raw = result.metadata.get("raw", {})
         message = (raw.get("choices") or [{}])[0].get("message", {})
@@ -171,7 +182,11 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
             provider_options=dict(kwargs),
         )
         yield from _bridge.stream_text(
-            self._provider_info(), self._model_info(), self._api_key, req
+            self._provider_info(),
+            self._model_info(),
+            self._api_key,
+            req,
+            timeout=self._timeout,
         )
 
     # -- embeddings / model listing (outside rickshaw_ai scope) ------------
@@ -202,6 +217,9 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
         )
 
     def validate(self) -> None:
+        if is_local_url(self._base_url):
+            self._validate_local()
+            return
         if _bridge.has_stored_credential(self.name):
             return
         if not self._api_key:
@@ -212,6 +230,22 @@ class OpenAIProvider(EmbeddingMixin, LLMProvider):
         with httpx.Client(timeout=15) as client:
             resp = client.get(f"{self._base_url}/models", headers=self._headers())
             resp.raise_for_status()
+
+    def _validate_local(self) -> None:
+        """Keyless validation for local endpoints: reachable and ≥1 model listed."""
+        try:
+            with httpx.Client(timeout=15) as client:
+                resp = client.get(f"{self._base_url}/models", headers=self._headers())
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(
+                f"{self._base_url} returned HTTP {exc.response.status_code}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ValueError(f"{self._base_url} unreachable") from exc
+        if not data.get("data"):
+            raise ValueError(f"{self._base_url} lists no models")
 
     def capabilities(self) -> Capabilities:
         return Capabilities(

@@ -10,11 +10,13 @@ import pytest
 import respx
 
 from rickshaw.config import ProviderProfile, is_local_url
+from rickshaw.providers import _bridge
 from rickshaw.providers.base import Effort, Message, Response, ToolCall, ToolSpec
 from rickshaw.providers.openai_provider import OpenAIProvider
 from rickshaw.providers.devin_provider import DevinProvider
 from rickshaw.providers.anthropic_provider import AnthropicProvider
 from rickshaw_ai.credentials.types import OAuthCredential
+from rickshaw_ai.factory import _new_http
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +75,16 @@ def test_openai_validate_success():
     )
     provider = OpenAIProvider(api_key="sk-test")
     provider.validate()
+
+
+@respx.mock
+def test_openai_validate_sends_bearer_header():
+    route = respx.get("https://api.openai.com/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "gpt-4o"}]})
+    )
+    provider = OpenAIProvider(api_key="sk-test")
+    provider.validate()
+    assert route.calls[0].request.headers["authorization"] == "Bearer sk-test"
 
 
 def test_openai_validate_no_key():
@@ -335,6 +347,217 @@ def test_openai_available_models():
     models = provider.available_models()
     assert "gpt-4o" in models
     assert "gpt-3.5-turbo" in models
+
+
+# ---------------------------------------------------------------------------
+# OpenAI provider — keyless validation for local endpoints
+# ---------------------------------------------------------------------------
+
+LOCAL_BASE = "http://localhost:8080/v1"
+
+
+@respx.mock
+def test_openai_local_validate_success_without_key():
+    route = respx.get(f"{LOCAL_BASE}/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "qwen2.5"}]})
+    )
+    provider = OpenAIProvider(api_key="", base_url=LOCAL_BASE)
+    provider.validate()
+    assert "authorization" not in route.calls[0].request.headers
+
+
+@respx.mock
+def test_openai_local_validate_sends_key_if_set():
+    route = respx.get(f"{LOCAL_BASE}/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "qwen2.5"}]})
+    )
+    provider = OpenAIProvider(api_key="sk-local", base_url=LOCAL_BASE)
+    provider.validate()
+    assert route.calls[0].request.headers["authorization"] == "Bearer sk-local"
+
+
+@respx.mock
+def test_openai_local_validate_unreachable():
+    respx.get(f"{LOCAL_BASE}/models").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    provider = OpenAIProvider(api_key="", base_url=LOCAL_BASE)
+    with pytest.raises(ValueError, match="unreachable") as excinfo:
+        provider.validate()
+    assert LOCAL_BASE in str(excinfo.value)
+
+
+@respx.mock
+def test_openai_local_validate_timeout_is_unreachable():
+    respx.get(f"{LOCAL_BASE}/models").mock(
+        side_effect=httpx.ConnectTimeout("timed out")
+    )
+    provider = OpenAIProvider(api_key="", base_url=LOCAL_BASE)
+    with pytest.raises(ValueError, match="unreachable"):
+        provider.validate()
+
+
+@respx.mock
+def test_openai_local_validate_no_models():
+    respx.get(f"{LOCAL_BASE}/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    provider = OpenAIProvider(api_key="", base_url=LOCAL_BASE)
+    with pytest.raises(ValueError, match="no models") as excinfo:
+        provider.validate()
+    assert LOCAL_BASE in str(excinfo.value)
+
+
+@respx.mock
+def test_openai_local_validate_http_error_includes_status():
+    respx.get(f"{LOCAL_BASE}/models").mock(
+        return_value=httpx.Response(500, json={"error": "boom"})
+    )
+    provider = OpenAIProvider(api_key="", base_url=LOCAL_BASE)
+    with pytest.raises(ValueError, match="500") as excinfo:
+        provider.validate()
+    assert LOCAL_BASE in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI provider — keyless generation against local endpoints
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_openai_local_complete_keyless(tmp_path, monkeypatch):
+    monkeypatch.setenv("RICKSHAW_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    route = respx.post(f"{LOCAL_BASE}/chat/completions").mock(
+        return_value=httpx.Response(200, json=OPENAI_CHAT_RESPONSE)
+    )
+    provider = OpenAIProvider(api_key="", base_url=LOCAL_BASE)
+    response = provider.complete([Message(role="user", content="Hi")])
+    assert response.text == "Hello from OpenAI!"
+    assert "authorization" not in route.calls[0].request.headers
+
+
+@respx.mock
+def test_openai_local_complete_ignores_env_openai_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("RICKSHAW_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-hosted")
+    route = respx.post(f"{LOCAL_BASE}/chat/completions").mock(
+        return_value=httpx.Response(200, json=OPENAI_CHAT_RESPONSE)
+    )
+    provider = OpenAIProvider(api_key="", base_url=LOCAL_BASE)
+    provider.complete([Message(role="user", content="Hi")])
+    assert "authorization" not in route.calls[0].request.headers
+
+
+@respx.mock
+def test_openai_local_complete_ignores_stored_hosted_credential(
+    tmp_path, monkeypatch
+):
+    cred_path = tmp_path / "credentials.json"
+    monkeypatch.setenv("RICKSHAW_CREDENTIALS_PATH", str(cred_path))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    credential = OAuthCredential(
+        access="oauth-access-token",
+        refresh="oauth-refresh-token",
+        expires=int((time.time() + 3600) * 1000),
+    )
+    _write_credential_file(cred_path, "openai", credential)
+    route = respx.post(f"{LOCAL_BASE}/chat/completions").mock(
+        return_value=httpx.Response(200, json=OPENAI_CHAT_RESPONSE)
+    )
+    provider = OpenAIProvider(api_key="", base_url=LOCAL_BASE)
+    provider.complete([Message(role="user", content="Hi")])
+    assert "authorization" not in route.calls[0].request.headers
+
+
+@respx.mock
+def test_openai_local_complete_sends_profile_key_when_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("RICKSHAW_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+    route = respx.post(f"{LOCAL_BASE}/chat/completions").mock(
+        return_value=httpx.Response(200, json=OPENAI_CHAT_RESPONSE)
+    )
+    provider = OpenAIProvider(api_key="local-secret", base_url=LOCAL_BASE)
+    provider.complete([Message(role="user", content="Hi")])
+    assert (
+        route.calls[0].request.headers["authorization"] == "Bearer local-secret"
+    )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI provider — Authorization header omitted for empty keys
+# ---------------------------------------------------------------------------
+
+
+def test_openai_headers_omit_authorization_when_key_empty():
+    provider = OpenAIProvider(api_key="", base_url=LOCAL_BASE)
+    headers = provider._headers()
+    assert "Authorization" not in headers
+    assert headers["Content-Type"] == "application/json"
+
+
+def test_openai_headers_include_authorization_when_key_set():
+    provider = OpenAIProvider(api_key="sk-test")
+    assert provider._headers()["Authorization"] == "Bearer sk-test"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI provider — per-profile generation timeout
+# ---------------------------------------------------------------------------
+
+
+def _spy_new_http(captured: list[httpx.Timeout]):
+    def _spy(http_client, timeout=None):
+        client = _new_http(http_client, timeout)
+        captured.append(client.timeout)
+        return client
+
+    return _spy
+
+
+@respx.mock
+def test_openai_complete_applies_profile_timeout():
+    respx.post(f"{LOCAL_BASE}/chat/completions").mock(
+        return_value=httpx.Response(200, json=OPENAI_CHAT_RESPONSE)
+    )
+    captured: list[httpx.Timeout] = []
+    provider = OpenAIProvider(api_key="sk-test", base_url=LOCAL_BASE, timeout=300)
+    with patch.object(_bridge, "_new_http", side_effect=_spy_new_http(captured)):
+        provider.complete([Message(role="user", content="Hi")])
+    assert captured == [httpx.Timeout(300)]
+
+
+@respx.mock
+def test_openai_complete_timeout_defaults_to_120():
+    respx.post("https://api.openai.com/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=OPENAI_CHAT_RESPONSE)
+    )
+    captured: list[httpx.Timeout] = []
+    provider = OpenAIProvider(api_key="sk-test")
+    with patch.object(_bridge, "_new_http", side_effect=_spy_new_http(captured)):
+        provider.complete([Message(role="user", content="Hi")])
+    assert captured == [httpx.Timeout(120.0)]
+
+
+@respx.mock
+def test_openai_stream_applies_profile_timeout():
+    sse = "".join(
+        f"data: {json.dumps(chunk)}\n\n"
+        for chunk in [
+            {"choices": [{"index": 0, "delta": {"content": "Hi!"}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ]
+    ) + "data: [DONE]\n\n"
+    respx.post(f"{LOCAL_BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200, text=sse, headers={"content-type": "text/event-stream"}
+        )
+    )
+    captured: list[httpx.Timeout] = []
+    provider = OpenAIProvider(api_key="sk-test", base_url=LOCAL_BASE, timeout=300)
+    with patch.object(_bridge, "_new_http", side_effect=_spy_new_http(captured)):
+        chunks = list(provider.stream([Message(role="user", content="Hi")]))
+    assert chunks == ["Hi!"]
+    assert captured == [httpx.Timeout(300)]
 
 
 # ---------------------------------------------------------------------------

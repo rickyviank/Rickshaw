@@ -60,6 +60,29 @@ async def test_no_credential_raises(monkeypatch):
             await resolve_auth(_provider(), store, http)
 
 
+async def test_requires_auth_false_resolves_anonymous(monkeypatch):
+    monkeypatch.delenv("ACME_API_KEY", raising=False)
+    store = InMemoryCredentialStore()
+    async with httpx.AsyncClient() as http:
+        auth = await resolve_auth(_provider(requires_auth=False), store, http)
+    assert auth.headers == {}
+
+
+async def test_requires_auth_false_still_prefers_stored_key():
+    store = InMemoryCredentialStore({"acme": ApiKeyCredential(key="stored-key")})
+    async with httpx.AsyncClient() as http:
+        auth = await resolve_auth(_provider(requires_auth=False), store, http)
+    assert auth.headers["Authorization"] == "Bearer stored-key"
+
+
+async def test_requires_auth_false_still_prefers_env(monkeypatch):
+    monkeypatch.setenv("ACME_API_KEY", "env-key")
+    store = InMemoryCredentialStore()
+    async with httpx.AsyncClient() as http:
+        auth = await resolve_auth(_provider(requires_auth=False), store, http)
+    assert auth.headers["Authorization"] == "Bearer env-key"
+
+
 async def test_empty_stored_api_key_raises(monkeypatch):
     """A stored ApiKeyCredential with an empty key must raise AuthError."""
     monkeypatch.delenv("ACME_API_KEY", raising=False)

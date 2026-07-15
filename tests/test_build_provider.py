@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import pytest
@@ -86,3 +87,45 @@ def test_embedding_model_passed_through(monkeypatch: pytest.MonkeyPatch):
     )
     provider = build_provider_from_profile("openai", profile, embedding_model="ada-002")
     assert provider._embedding_model == "ada-002"
+
+
+def test_profile_timeout_passed_through(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("LLAMACPP_API_KEY", raising=False)
+    profile = ProviderProfile(
+        base_url="http://localhost:8080/v1",
+        model="qwen2.5",
+        api_key_env="LLAMACPP_API_KEY",
+        wire_format="openai",
+        timeout=300,
+    )
+    provider = build_provider_from_profile("llamacpp", profile)
+    assert isinstance(provider, OpenAIProvider)
+    assert provider._timeout == 300
+
+
+def test_profile_without_timeout_defaults_to_none(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OAI_KEY", "sk-x")
+    profile = ProviderProfile(
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o",
+        api_key_env="OAI_KEY",
+        wire_format="openai",
+    )
+    provider = build_provider_from_profile("openai", profile)
+    assert provider._timeout is None
+
+
+def test_local_profile_empty_key_no_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    profile = ProviderProfile(
+        base_url="http://localhost:11434/v1",
+        model="llama3",
+        api_key_env="OLLAMA_API_KEY",
+        wire_format="openai",
+    )
+    with caplog.at_level(logging.WARNING, logger="rickshaw.providers.build"):
+        provider = build_provider_from_profile("ollama", profile)
+    assert provider._api_key == ""
+    assert not caplog.records

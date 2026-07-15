@@ -14,7 +14,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -59,6 +59,7 @@ class ProviderProfile:
     model: str
     api_key_env: str
     wire_format: str = "openai"
+    timeout: float | None = None
 
     def has_api_key(self) -> bool:
         """Return ``True`` when the configured env var holds a non-empty key."""
@@ -94,6 +95,25 @@ def is_local_url(url: str) -> bool:
         return addr.is_loopback or addr.is_private
     except ValueError:
         return False
+
+
+def _parse_timeout(raw: object, provider_name: str) -> float | None:
+    """Return a positive request timeout in seconds, or ``None`` when unset.
+
+    Invalid values are ignored with a warning (lenient, like ``status_bar``).
+    """
+    if raw is None:
+        return None
+    try:
+        timeout = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if timeout <= 0:
+        logger.warning(
+            "Ignoring invalid timeout %r for provider %r", raw, provider_name
+        )
+        return None
+    return timeout
 
 
 def _parse_effort(raw: str) -> Effort:
@@ -163,7 +183,62 @@ _BUILTIN_PROFILES: dict[str, ProviderProfile] = {
         api_key_env="ANTHROPIC_API_KEY",
         wire_format="anthropic",
     ),
+    # Local OpenAI-compatible presets. Keyless by default: the api_key_env is
+    # sent when set (e.g. ``llama-server --api-key``) but never required. The
+    # model is resolved at activation from the server's ``/v1/models``.
+    "llamacpp": ProviderProfile(
+        base_url="http://localhost:8080/v1",
+        model="",
+        api_key_env="LLAMACPP_API_KEY",
+        wire_format="openai",
+    ),
+    "mlx": ProviderProfile(
+        base_url="http://localhost:8080/v1",
+        model="",
+        api_key_env="MLX_API_KEY",
+        wire_format="openai",
+    ),
+    "ollama": ProviderProfile(
+        base_url="http://localhost:11434/v1",
+        model="",
+        api_key_env="OLLAMA_API_KEY",
+        wire_format="openai",
+    ),
+    "lmstudio": ProviderProfile(
+        base_url="http://localhost:1234/v1",
+        model="",
+        api_key_env="LMSTUDIO_API_KEY",
+        wire_format="openai",
+    ),
 }
+
+LOCAL_PRESET_NAMES = ("llamacpp", "mlx", "ollama", "lmstudio")
+
+_LOCAL_SERVER_DOWN_HINTS = {
+    "llamacpp": "is llama-server running?",
+    "mlx": "is mlx_lm.server running?",
+    "ollama": "is `ollama serve` running?",
+    "lmstudio": "is the LM Studio local server running?",
+}
+
+_LOCAL_NO_MODELS_HINTS = {
+    "llamacpp": "start llama-server with a model: llama-server -m <model.gguf>",
+    "mlx": "start the server with a model: mlx_lm.server --model <repo-or-path>",
+    "ollama": "pull a model first: ollama pull <model>",
+    "lmstudio": "download and load a model in LM Studio first",
+}
+
+
+def local_server_down_hint(provider_name: str) -> str:
+    """Actionable hint for an unreachable local provider."""
+    return _LOCAL_SERVER_DOWN_HINTS.get(provider_name, "is the server running?")
+
+
+def local_no_models_hint(provider_name: str) -> str:
+    """Actionable hint for a local provider that lists no models."""
+    return _LOCAL_NO_MODELS_HINTS.get(
+        provider_name, "load or download a model on the server first"
+    )
 
 
 def load_config(
@@ -215,12 +290,23 @@ def load_config(
     # Merge provider profiles: builtins → settings.json → overrides
     providers: dict[str, ProviderProfile] = dict(_BUILTIN_PROFILES)
     for pname, pdata in settings.get("providers", {}).items():
+        builtin = _BUILTIN_PROFILES.get(pname)
         providers[pname] = ProviderProfile(
-            base_url=pdata.get("base_url", ""),
+            base_url=pdata.get("base_url", builtin.base_url if builtin else ""),
             model=pdata.get("model", ""),
-            api_key_env=pdata.get("api_key_env", ""),
+            api_key_env=pdata.get(
+                "api_key_env", builtin.api_key_env if builtin else ""
+            ),
             wire_format=pdata.get("wire_format", "openai"),
+            timeout=_parse_timeout(pdata.get("timeout"), pname),
         )
+
+    # Env-based base-URL overrides for the local presets (mirrors the
+    # dedicated *_BASE_URL vars of the hosted builtins).
+    for pname in LOCAL_PRESET_NAMES:
+        env_base = _get(f"{pname.upper()}_BASE_URL", "")
+        if env_base:
+            providers[pname] = replace(providers[pname], base_url=env_base)
 
     # Settings-level provider/effort/embedding overrides (below env)
     settings_provider = settings.get("provider", "")
@@ -254,14 +340,17 @@ def load_config(
     providers["openai"] = ProviderProfile(
         base_url=openai_base, model=openai_model,
         api_key_env="OPENAI_API_KEY", wire_format="openai",
+        timeout=providers["openai"].timeout,
     )
     providers["devin"] = ProviderProfile(
         base_url=devin_base, model="devin",
         api_key_env="DEVIN_API_KEY", wire_format="devin",
+        timeout=providers["devin"].timeout,
     )
     providers["anthropic"] = ProviderProfile(
         base_url=anthropic_base, model=anthropic_model,
         api_key_env="ANTHROPIC_API_KEY", wire_format="anthropic",
+        timeout=providers["anthropic"].timeout,
     )
 
     cfg = RickshawConfig(

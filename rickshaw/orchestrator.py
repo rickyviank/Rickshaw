@@ -14,6 +14,7 @@ from typing import Callable
 
 import httpx
 
+from rickshaw.config import is_local_url
 from rickshaw.memory.service import MemoryService
 from rickshaw.memory.tools import build_memory_registry
 from rickshaw.prompt.builder import PromptBuilder
@@ -26,6 +27,7 @@ from rickshaw.providers.base import (
 )
 from rickshaw.queue import Job, JobQueue, JobType
 from rickshaw.tool_registry import ToolRegistry
+from rickshaw_ai.errors import ConnectionError as RAIConnectionError
 
 # Callback invoked with incremental text as a turn's final answer is produced.
 StreamCallback = Callable[[str], None]
@@ -78,12 +80,43 @@ def _is_transient_error(exc: Exception) -> bool:
     return False
 
 
+_CONNECTION_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    ConnectionError,
+    RAIConnectionError,
+)
+
+
+def _local_connection_error(exc: Exception, provider: LLMProvider) -> Exception | None:
+    """Return a fail-fast error when *exc* is a connection failure against a
+    local endpoint, or ``None`` when normal retry handling should apply.
+
+    A down local server is user-fixable, so it is surfaced immediately instead
+    of retried. The returned error's message always contains the endpoint's
+    base URL so the UI can attach hints; the original *exc* is preserved as
+    ``__cause__`` when wrapping is needed.
+    """
+    if not isinstance(exc, _CONNECTION_ERRORS):
+        return None
+    base_url = getattr(provider, "_base_url", "")
+    if not is_local_url(base_url):
+        return None
+    if base_url in str(exc):
+        return exc
+    wrapped = ConnectionError(f"cannot connect to {base_url}: {exc}")
+    wrapped.__cause__ = exc
+    return wrapped
+
+
 class Orchestrator:
     """Turn loop with memory-augmented retrieval and tool dispatch.
 
     Degrades gracefully if:
     * The provider is unreachable (retries with backoff, then falls back to
-      local remember/recall/ranking).
+      local remember/recall/ranking). Exception: connection failures against
+      local endpoints are never retried — the turn fails immediately with an
+      error naming the base URL.
     * The provider reports ``function_calling=False`` (skips tool advertising
       and surfaces a warning).
     """
@@ -125,7 +158,12 @@ class Orchestrator:
             )
 
     def _complete_with_retry(self, messages: list[Message], tool_specs) -> Response:
-        """Call the provider, retrying transient errors with exponential backoff."""
+        """Call the provider, retrying transient errors with exponential backoff.
+
+        Connection failures against local endpoints are never retried: a down
+        local server is user-fixable, so the error is re-raised immediately
+        with the endpoint's base URL in its message.
+        """
         attempt = 0
         while True:
             try:
@@ -133,6 +171,12 @@ class Orchestrator:
                     messages, effort=self.effort, tools=tool_specs,
                 )
             except Exception as exc:
+                local_err = _local_connection_error(exc, self.provider)
+                if local_err is not None:
+                    logger.warning(
+                        "Local provider unreachable, failing fast: %s", local_err,
+                    )
+                    raise local_err
                 if _is_transient_error(exc) and attempt < self.max_retries:
                     delay = self.retry_backoff * (2 ** attempt)
                     logger.warning(
@@ -197,6 +241,8 @@ class Orchestrator:
         try:
             response = self._complete_with_retry(messages, tool_specs)
         except Exception as exc:
+            if _local_connection_error(exc, self.provider) is not None:
+                raise
             logger.warning("Provider unreachable after retries: %s", exc)
             warnings.append(_PROVIDER_UNREACHABLE_MSG)
             results = self.memory.recall(task_input)
@@ -243,6 +289,8 @@ class Orchestrator:
             try:
                 response = self._complete_with_retry(messages, tool_specs)
             except Exception as exc:
+                if _local_connection_error(exc, self.provider) is not None:
+                    raise
                 logger.warning("Follow-up provider call failed after retries: %s", exc)
                 warnings.append(_PROVIDER_UNREACHABLE_MSG)
                 break
@@ -283,7 +331,8 @@ class Orchestrator:
         Transient errors are retried only before any text has been emitted;
         once streaming has started we can't safely restart. On failure we
         degrade to local recall, mirroring :meth:`run_turn`'s non-streaming
-        fallback.
+        fallback. Connection failures against local endpoints are never
+        retried — they propagate immediately with the base URL in the message.
         """
         parts: list[str] = []
         attempt = 0
@@ -294,6 +343,13 @@ class Orchestrator:
                     on_delta(chunk)
                 break
             except Exception as exc:
+                if not parts:
+                    local_err = _local_connection_error(exc, self.provider)
+                    if local_err is not None:
+                        logger.warning(
+                            "Local provider unreachable, failing fast: %s", local_err,
+                        )
+                        raise local_err
                 if not parts and _is_transient_error(exc) and attempt < self.max_retries:
                     delay = self.retry_backoff * (2 ** attempt)
                     logger.warning(

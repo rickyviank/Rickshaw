@@ -164,8 +164,12 @@ class Models:
         await self._http.aclose()
 
 
-def _new_http(http_client: httpx.AsyncClient | None) -> httpx.AsyncClient:
-    return http_client or httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+def _new_http(
+    http_client: httpx.AsyncClient | None, timeout: float | None = None
+) -> httpx.AsyncClient:
+    return http_client or httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0 if timeout is None else timeout)
+    )
 
 
 def create_models(
@@ -174,12 +178,13 @@ def create_models(
     http_client: httpx.AsyncClient | None = None,
     retry: RetryPolicy | None = None,
     providers: list[ProviderInfo] | None = None,
+    timeout: float | None = None,
 ) -> Models:
     """Build a :class:`Models` collection from *providers* (or an empty set)."""
     return Models(
         list(providers or []),
         credentials=credentials or InMemoryCredentialStore(),
-        http_client=_new_http(http_client),
+        http_client=_new_http(http_client, timeout),
         retry=retry or RetryPolicy(),
     )
 
@@ -190,6 +195,7 @@ def builtin_models(
     http_client: httpx.AsyncClient | None = None,
     retry: RetryPolicy | None = None,
     providers: list[ProviderInfo] | None = None,
+    timeout: float | None = None,
 ) -> Models:
     """Build a :class:`Models` collection from the curated built-in providers.
 
@@ -199,6 +205,6 @@ def builtin_models(
     return Models(
         all_providers,
         credentials=credentials or InMemoryCredentialStore(),
-        http_client=_new_http(http_client),
+        http_client=_new_http(http_client, timeout),
         retry=retry or RetryPolicy(),
     )

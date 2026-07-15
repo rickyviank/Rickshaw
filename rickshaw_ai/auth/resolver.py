@@ -9,7 +9,9 @@ Resolution order (strict):
      raises :class:`AuthError` — it does NOT fall back to env.
 2. Environment variables (``ProviderInfo.env_keys``, in order) — only when no
    credential is stored at all.
-3. Otherwise raise :class:`AuthError` explaining how to authenticate.
+3. Anonymous (no auth headers) when ``ProviderInfo.requires_auth`` is False
+   (keyless local servers).
+4. Otherwise raise :class:`AuthError` explaining how to authenticate.
 """
 
 from __future__ import annotations
@@ -50,6 +52,9 @@ async def resolve_auth(
         val = os.environ.get(env_key)
         if val:
             return ResolvedAuth(headers=_apply_api_key(provider, val))
+
+    if not provider.requires_auth:
+        return ResolvedAuth(headers={})
 
     how = (
         f"set one of {provider.env_keys}"
