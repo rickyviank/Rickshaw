@@ -147,11 +147,53 @@ class LLMProvider(ABC):
         The default implementation falls back to :meth:`complete` and yields
         the full text as a single chunk, so providers without native streaming
         still satisfy the interface.
+
+        New code should prefer :meth:`stream_events`, which exposes tool-call
+        and reasoning deltas as structured events.
         """
+        for event in self.stream_events(
+            messages, effort=effort, tools=tools, tool_choice=tool_choice, **kwargs
+        ):
+            from rickshaw import events
+
+            if isinstance(event, events.TextDelta):
+                yield event.text
+            elif isinstance(event, events.StreamDone):
+                break
+
+    def stream_events(
+        self,
+        messages: list[Message],
+        effort: Effort = Effort.MEDIUM,
+        tools: list[ToolSpec] | None = None,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> "Iterator[StreamEvent]":
+        """Yield structured stream events.
+
+        The default implementation falls back to :meth:`complete` and emits the
+        response as a sequence of ``ToolCallStart`` / ``ToolCallEnd`` events
+        (when the response contains tool calls) followed by a single
+        ``TextDelta`` and ``StreamDone``. Providers with native streaming should
+        override this to yield ``TextDelta``, ``ThinkingDelta``,
+        ``ToolCallStart``, ``ToolCallDelta``, ``ToolCallEnd``, and ``StreamDone``
+        as they arrive.
+        """
+        from rickshaw import events
+
         response = self.complete(
             messages, effort=effort, tools=tools, tool_choice=tool_choice, **kwargs
         )
-        yield response.text
+        for tc in response.tool_calls:
+            yield events.ToolCallStart(id=tc.id, name=tc.name)
+            yield events.ToolCallEnd(call=tc)
+        yield events.TextDelta(text=response.text)
+        yield events.StreamDone(
+            text=response.text,
+            model=response.model,
+            usage=response.usage,
+            tool_calls=response.tool_calls,
+        )
 
     @abstractmethod
     def available_models(self) -> list[str]:

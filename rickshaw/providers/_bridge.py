@@ -24,6 +24,7 @@ from rickshaw.providers.base import (
     Message,
     Response,
     TokenUsage,
+    ToolCall,
 )
 from rickshaw_ai._builtins import default_providers
 from rickshaw_ai import (
@@ -39,7 +40,15 @@ from rickshaw_ai.credentials.types import Credential
 from rickshaw_ai.factory import _new_http
 from rickshaw_ai.providers import ProviderRuntime, adapter_for
 from rickshaw_ai.registry import ModelInfo, ProviderInfo, RetryPolicy
-from rickshaw_ai.streaming import StreamDone, TextDelta
+from rickshaw_ai.streaming import (
+    StreamDone as AIStreamDone,
+    StreamError as AIStreamError,
+    TextDelta as AITextDelta,
+    ThinkingDelta as AIThinkingDelta,
+    ToolCallStart as AIToolCallStart,
+    ToolCallDelta as AIToolCallDelta,
+    ToolCallEnd as AIToolCallEnd,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +251,31 @@ def stream_text(
     req: GenerateRequest,
     timeout: float | None = None,
 ) -> Iterator[str]:
+    """Yield plain text chunks from a streaming request (backward-compatible)."""
+    from rickshaw import events
+
+    for event in stream_events(provider, model, api_key, req, timeout=timeout):
+        if isinstance(event, events.TextDelta) and event.text:
+            yield event.text
+        elif isinstance(event, events.StreamDone):
+            break
+
+
+def stream_events(
+    provider: ProviderInfo,
+    model: ModelInfo,
+    api_key: str,
+    req: GenerateRequest,
+    timeout: float | None = None,
+) -> Iterator["events.StreamEvent"]:
+    """Yield normalized :mod:`rickshaw.events` stream events.
+
+    Maps the ``rickshaw_ai`` adapter's native stream events into the harness's
+    public event types. Accumulates text and tool calls and emits a final
+    :class:`rickshaw.events.StreamDone` with authoritative usage/model info.
+    """
+    from rickshaw import events
+
     def _factory() -> AsyncIterator:
         async def _agen():
             async with _new_http(None, timeout) as http:
@@ -251,9 +285,49 @@ def stream_text(
         return _agen()
 
     for event in _iter_async(_factory):
-        if isinstance(event, TextDelta) and event.text:
-            yield event.text
-        elif isinstance(event, StreamDone):
+        if isinstance(event, AITextDelta):
+            yield events.TextDelta(text=event.text)
+        elif isinstance(event, AIThinkingDelta):
+            yield events.ThinkingDelta(text=event.text)
+        elif isinstance(event, AIToolCallStart):
+            yield events.ToolCallStart(id=event.id, name=event.name)
+        elif isinstance(event, AIToolCallDelta):
+            yield events.ToolCallDelta(
+                id=event.id, arguments_fragment=event.arguments_fragment
+            )
+        elif isinstance(event, AIToolCallEnd):
+            call = event.call
+            yield events.ToolCallEnd(
+                call=ToolCall(
+                    id=call.id,
+                    name=call.name,
+                    arguments=call.arguments,
+                    raw=call.model_dump(),
+                )
+            )
+        elif isinstance(event, AIStreamError):
+            yield events.StreamError(message=event.message)
+        elif isinstance(event, AIStreamDone):
+            result = event.result
+            usage = TokenUsage(
+                prompt_tokens=result.usage.input_tokens,
+                completion_tokens=result.usage.output_tokens,
+                total_tokens=result.usage.input_tokens + result.usage.output_tokens,
+            )
+            yield events.StreamDone(
+                text=result.text,
+                model=result.metadata.get("response_model", model.model),
+                usage=usage,
+                tool_calls=[
+                    ToolCall(
+                        id=tc.id,
+                        name=tc.name,
+                        arguments=tc.arguments,
+                        raw=tc.model_dump(),
+                    )
+                    for tc in result.tool_calls
+                ],
+            )
             break
 
 
@@ -266,6 +340,7 @@ __all__ = [
     "has_stored_credential",
     "generate",
     "stream_text",
+    "stream_events",
     "GenerateRequest",
     "Reasoning",
 ]
