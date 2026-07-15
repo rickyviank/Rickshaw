@@ -53,6 +53,7 @@ from rickshaw.settings import load_settings, save_settings
 from rickshaw.trace_store import TraceStore
 
 from rickshaw import events
+from rickshaw.trace_render import format_trace, TraceLine, TraceView
 
 from rickshaw_ai._builtins import default_providers as _builtin_providers
 from rickshaw_ai.credentials.store import FileCredentialStore
@@ -115,6 +116,35 @@ STATUS_BAR_DROP_ORDER = ("price", "tokens", "context")
 STATUS_BAR_NARROW_WIDTH = 80
 
 _DEFAULT_HINT = "/help  ·  ^o expand trace  ·  ctrl+up/down navigate  ·  esc interrupt  ·  ^c quit"
+_TRACE_HINT = "r raw  ·  tab expand event  ·  esc return to prompt"
+
+# Map formatter color class names to Textual markup styles.
+_TRACE_STYLE_MAP = {
+    "trace-context": "$rk-assistant",
+    "trace-tool": "$rk-accent",
+    "trace-llm": "$rk-success",
+    "trace-answer": "$rk-text",
+    "trace-thinking": "$rk-meta",
+    "trace-error": "$rk-error",
+    "trace-retry": "$rk-warn",
+    "trace-memory": "$rk-success",
+    "trace-job": "$rk-meta",
+    "trace-prompt": "$rk-assistant",
+    "trace-done": "$rk-success",
+}
+
+
+def _style_for(color_class: str) -> str:
+    """Return a Textual markup style string for a formatter color class."""
+    if not color_class:
+        return ""
+    if color_class.startswith(("$", "#")) or color_class in (
+        "dim", "bold", "italic", "reverse",
+    ):
+        return color_class
+    return _TRACE_STYLE_MAP.get(color_class, "$rk-text")
+
+
 _USER_MARK = "[#e0a86b]›[/]"  # amber angle-quote before each user message
 _PROMPT_GLYPH = "›"
 _ASSISTANT_LABEL = "o--o [dim]rickshaw[/]"
@@ -429,6 +459,23 @@ def make_app(
             self.text = new
 
         def _on_key(self, event) -> None:
+            app = self.app
+            if event.key == "tab":
+                if app._menu_open and app._menu_items:
+                    if app._menu_accept(via_enter=False):
+                        event.prevent_default()
+                        event.stop()
+                        return
+                if (
+                    app._login_state is None
+                    and app._settings_state is None
+                    and app._provider_add_state is None
+                    and app._turns
+                ):
+                    app.focus_trace()
+                    event.prevent_default()
+                    event.stop()
+                    return
             if event.key == "enter":
                 event.prevent_default()
                 event.stop()
@@ -440,94 +487,235 @@ def make_app(
                 self.insert("\n")
                 return
 
+    class TraceLineWidget(Static):
+        """A single focusable line inside an expanded trace block."""
+
+        can_focus = True
+
+        def __init__(
+            self,
+            trace_block: "TraceBlock",
+            line: TraceLine,
+            index: int,
+            max_content_height: int,
+        ) -> None:
+            super().__init__("", classes="trace-line", markup=True)
+            self.trace_block = trace_block
+            self.line = line
+            self.index = index
+            self.max_content_height = max_content_height
+            self._content_widget: Static | None = None
+            self._expanded = (
+                line.content is not None
+                and not line.is_capped
+                and line.expandable
+            )
+
+        def on_mount(self) -> None:
+            self._refresh()
+
+        def _line_text(self) -> str:
+            from rich.markup import escape
+
+            ts = self.line.timestamp or ""
+            style = _style_for(self.line.color_class)
+            if self.line.label:
+                label = escape(self.line.label)
+                label_markup = f"[{style}]{label}[/]" if style else label
+            else:
+                label_markup = ""
+            text = f"{ts} {label_markup}".rstrip()
+
+            marker = ""
+            if self.line.expandable and not self.trace_block._raw_mode:
+                marker = "[-]" if self._expanded else "[+]"
+                text += f" [dim]{marker}[/]"
+
+            if self.trace_block._raw_mode:
+                body = self.line.raw_json or self.line.summary or ""
+            else:
+                body = self.line.summary
+            if body:
+                text += f" {escape(body)}"
+            return text
+
+        def _ensure_content_widget(self) -> None:
+            if self._content_widget is not None:
+                return
+            from rich.markup import escape
+
+            if self.trace_block._raw_mode:
+                text = self.line.raw_json or ""
+                classes = "trace-content trace-raw"
+            elif self.line.content is not None:
+                text = self.line.content
+                classes = "trace-content"
+            else:
+                text = self.line.raw_json or ""
+                classes = "trace-content trace-raw"
+            self._content_widget = Static(
+                text, markup=False, classes=classes
+            )
+            if (
+                self.line.is_capped
+                and self.line.content is not None
+                and not self.trace_block._raw_mode
+            ):
+                self._content_widget.styles.max_height = self.max_content_height
+                self._content_widget.styles.overflow_y = "scroll"
+            self.mount(self._content_widget)
+            self._content_widget.display = False
+
+        def _refresh(self) -> None:
+            if self._expanded:
+                self._ensure_content_widget()
+            if self._content_widget is not None:
+                self._content_widget.display = self._expanded
+            self.update(self._line_text())
+
+        def toggle_expand(self) -> None:
+            if self.trace_block._raw_mode:
+                return
+            self._expanded = not self._expanded
+            self._refresh()
+
+        def set_raw_mode(self, raw_mode: bool) -> None:
+            if raw_mode:
+                self._expanded = False
+            else:
+                self._expanded = (
+                    self.line.content is not None
+                    and not self.line.is_capped
+                    and self.line.expandable
+                )
+            if self._content_widget is not None:
+                self._content_widget.remove()
+                self._content_widget = None
+            self._refresh()
+
+        def on_key(self, event) -> None:
+            if event.key == "up":
+                self.trace_block.focus_line(self.index - 1)
+                event.stop()
+                event.prevent_default()
+            elif event.key == "down":
+                self.trace_block.focus_line(self.index + 1)
+                event.stop()
+                event.prevent_default()
+            elif event.key == "enter":
+                self.toggle_expand()
+                event.stop()
+                event.prevent_default()
+            elif event.key in ("r", "R"):
+                self.trace_block.toggle_raw_mode()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "escape":
+                self.trace_block.focus_prompt()
+                event.stop()
+                event.prevent_default()
+
+        def on_focus(self, event) -> None:
+            if hasattr(self.trace_block, "_on_line_focus_changed"):
+                self.trace_block._on_line_focus_changed()
+
+        def on_blur(self, event) -> None:
+            if hasattr(self.trace_block, "_on_line_focus_changed"):
+                self.trace_block._on_line_focus_changed()
+
     class TraceBlock(Vertical):
         """Collapsible per-turn trace summary/details block."""
 
         def __init__(
             self,
-            events: list[events.TurnEvent],
+            event_records: list[tuple[events.TurnEvent, float]],
             turn_id: str,
             duration: float,
             status: str,
+            task_input: str = "",
+            provider: str = "",
+            model: str = "",
+            width: int = 80,
+            height: int = 24,
         ) -> None:
             super().__init__(classes="trace-block")
-            self.events = events
+            self.event_records = event_records
             self.turn_id = turn_id
             self.duration = duration
             self.status = status
+            self.task_input = task_input
+            self.provider = provider
+            self.model = model
+            self._width = width
+            self._height = height
             self._expanded = False
+            self._raw_mode = False
+            self.view: TraceView | None = None
+            self._line_widgets: list[TraceLineWidget] = []
+
+        def _build_view(self) -> None:
+            if self.view is not None:
+                return
+            self.view = format_trace(
+                self.event_records,
+                task_input=self.task_input,
+                provider=self.provider,
+                model=self.model,
+                status=self.status,
+                duration=self.duration,
+                width=self._width,
+                height=self._height,
+            )
 
         def compose(self) -> ComposeResult:
             from rich.markup import escape
 
-            summary = Static(escape(self._summary_text()), classes="summary")
-            summary.display = True
-            yield summary
-            details = Static(escape(self._details_text()), classes="details")
-            details.display = False
-            yield details
+            self._build_view()
+            yield Static(escape(self._summary_text()), classes="summary")
+            yield Vertical(classes="details")
 
         def on_mount(self) -> None:
             self.summary = self.query_one(".summary", Static)
-            self.details = self.query_one(".details", Static)
+            self.details = self.query_one(".details", Vertical)
+            self._render_details()
 
         def _summary_text(self) -> str:
-            n = len(self.events)
-            tool_calls = sum(
-                1 for e in self.events if isinstance(e, events.TurnToolCallStart)
-            )
-            retries = sum(1 for e in self.events if isinstance(e, events.Retry))
-            degraded = any(isinstance(e, events.Degraded) for e in self.events)
+            if self.view is not None and self.view.summary:
+                return self.view.summary
+            n = len(self.event_records)
+            return f"{n} events · {self.status} · {self.duration:.1f}s"
 
-            parts = [f"{n} events"]
-            parts.append(
-                f"{tool_calls} tool call{'s' if tool_calls != 1 else ''}"
-            )
-            if retries:
-                parts.append(
-                    f"{retries} retr{'ies' if retries != 1 else 'y'}"
-                )
-            if degraded:
-                parts.append("degraded")
-            if self.status not in ("completed",):
-                parts.append(self.status)
-            parts.append(f"{self.duration:.1f}s")
-            return " · ".join(parts)
-
-        def _details_text(self) -> str:
-            import json
-
-            lines: list[str] = []
-            lines.append(f"turn: {self.turn_id}")
-            lines.append(f"status: {self.status}")
-            lines.append(f"duration: {self.duration:.2f}s")
-            lines.append("")
-            for ev in self.events:
-                data = ev.model_dump(mode="json")
-                lines.append(f"--- {data.pop('type', ev.type)} ---")
-                for key, value in data.items():
-                    try:
-                        rendered = json.dumps(value, ensure_ascii=False, indent=2)
-                    except TypeError:
-                        rendered = str(value)
-                    lines.append(f"{key}:")
-                    for sub in rendered.splitlines():
-                        lines.append(f"  {sub}")
-                lines.append("")
-            return "\n".join(lines)
+        def _render_details(self) -> None:
+            if self.details is None or self.view is None:
+                return
+            self.details.remove_children()
+            self._line_widgets.clear()
+            for header in self.view.header_lines:
+                self.details.mount(Static(header, classes="trace-header"))
+            app_height = getattr(self.app, "size", None)
+            height = app_height.height if app_height is not None else self._height
+            max_h = max(5, int(height * 0.3))
+            for index, line in enumerate(self.view.lines):
+                widget = TraceLineWidget(self, line, index, max_h)
+                self.details.mount(widget)
+                self._line_widgets.append(widget)
 
         def toggle(self) -> None:
             from rich.markup import escape
 
             self._expanded = not self._expanded
             if self._expanded:
-                self.details.update(escape(self._details_text()))
                 self.details.display = True
                 self.add_class("expanded")
             else:
+                focused = self.app.focused
+                if isinstance(focused, TraceLineWidget) and focused.trace_block is self:
+                    self.focus_prompt()
                 self.details.display = False
                 self.remove_class("expanded")
             self.summary.update(escape(self._summary_text()))
+            if hasattr(self.app, "_update_trace_hint"):
+                self.app._update_trace_hint()
 
         def expand(self) -> None:
             if not self._expanded:
@@ -536,6 +724,31 @@ def make_app(
         def collapse(self) -> None:
             if self._expanded:
                 self.toggle()
+
+        def focus_first_line(self) -> None:
+            if self._line_widgets:
+                self._line_widgets[0].focus()
+
+        def focus_line(self, index: int) -> None:
+            if not self._line_widgets:
+                return
+            index = max(0, min(index, len(self._line_widgets) - 1))
+            self._line_widgets[index].focus()
+
+        def focus_prompt(self) -> None:
+            try:
+                self.app.query_one("#prompt", PromptArea).focus()
+            except Exception:
+                pass
+
+        def toggle_raw_mode(self) -> None:
+            self._raw_mode = not self._raw_mode
+            for widget in self._line_widgets:
+                widget.set_raw_mode(self._raw_mode)
+
+        def _on_line_focus_changed(self) -> None:
+            if hasattr(self.app, "_update_trace_hint"):
+                self.app._update_trace_hint()
 
     class RickshawTUI(App):
         """Textual application driving turns through the Orchestrator."""
@@ -663,6 +876,22 @@ def make_app(
           .trace-block.selected {
               border: tall $rk-accent;
           }
+          .trace-line { height: auto; color: $rk-text; }
+          .trace-line:focus { background: $rk-border; }
+          .trace-header { color: $rk-meta; height: auto; }
+          .trace-content { height: auto; color: $rk-text; }
+          .trace-raw { color: $rk-meta; }
+          .trace-context { color: $rk-assistant; }
+          .trace-tool { color: $rk-accent; }
+          .trace-llm { color: $rk-success; }
+          .trace-answer { color: $rk-text; }
+          .trace-thinking { color: $rk-meta; }
+          .trace-error { color: $rk-error; }
+          .trace-retry { color: $rk-warn; }
+          .trace-memory { color: $rk-success; }
+          .trace-job { color: $rk-meta; }
+          .trace-prompt { color: $rk-assistant; }
+          .trace-done { color: $rk-success; }
         """
 
         BINDINGS = [
@@ -672,6 +901,7 @@ def make_app(
             Binding("ctrl+up", "prev_turn", "Prev turn", show=False),
             Binding("ctrl+down", "next_turn", "Next turn", show=False),
             Binding("ctrl+o", "toggle_trace", "Toggle trace", show=False),
+            Binding("r", "toggle_trace_raw", "Toggle raw trace", show=False),
         ]
 
         def __init__(self, trace_store: TraceStore | None = None) -> None:
@@ -697,11 +927,12 @@ def make_app(
             self._indicator: Static | None = None
             self._indicator_timer = None
             self._turn_started = 0.0
+            self._turn_input: str = ""
             self._spinner_idx = 0
             self._live_tokens = 0
             self._first_token = False
             self._phase_label = "Thinking…"
-            self._current_events: list[events.TurnEvent] = []
+            self._current_events: list[tuple[events.TurnEvent, float]] = []
             self._current_turn_id: str | None = None
             self._current_user: Static | None = None
             self._turns: list[dict] = []
@@ -2124,6 +2355,7 @@ def make_app(
             self._current_md = None
             self._first_token = False
             self._phase_label = "Thinking…"
+            self._turn_input = text
             self._current_events = []
             self._current_turn_id = None
             self._live_tokens = 0
@@ -2209,7 +2441,7 @@ def make_app(
         def _on_turn_event(self, event: events.TurnEvent, seq: int) -> None:
             if seq != self._turn_seq or not self._turn_active:
                 return
-            self._current_events.append(event)
+            self._current_events.append((event, time.monotonic() - self._turn_started))
             if isinstance(event, events.TurnStart):
                 self._current_turn_id = event.turn_id
 
@@ -2299,11 +2531,24 @@ def make_app(
                 return
             turn_id = self._current_turn_id or ""
             duration = time.monotonic() - self._turn_started
+            provider_name = self.provider.name if self.provider is not None else ""
+            model_name = (
+                getattr(self.provider, "_model", "") or provider_name
+                if self.provider is not None
+                else ""
+            )
+            width = getattr(self.size, "width", 0) or 80
+            height = getattr(self.size, "height", 0) or 24
             trace = TraceBlock(
-                events=list(self._current_events),
+                event_records=list(self._current_events),
                 turn_id=turn_id,
                 duration=duration,
                 status=status,
+                task_input=self._turn_input,
+                provider=provider_name,
+                model=model_name,
+                width=width,
+                height=height,
             )
             self.query_one("#transcript", VerticalScroll).mount(trace)
             self._turns.append(
@@ -2430,6 +2675,32 @@ def make_app(
             if self._selected_turn_index == -1:
                 self._set_selected_turn(len(self._turns) - 1)
             self._turns[self._selected_turn_index]["trace"].toggle()
+
+        def action_toggle_trace_raw(self) -> None:
+            focused = self.focused
+            if isinstance(focused, TraceLineWidget):
+                focused.trace_block.toggle_raw_mode()
+
+        def focus_trace(self) -> None:
+            if not self._turns:
+                return
+            if self._selected_turn_index == -1:
+                self._set_selected_turn(len(self._turns) - 1)
+            trace = self._turns[self._selected_turn_index]["trace"]
+            if not trace._expanded:
+                trace.expand()
+            trace.focus_first_line()
+            self._update_trace_hint()
+
+        def _update_trace_hint(self) -> None:
+            focused = self.focused
+            if (
+                isinstance(focused, TraceLineWidget)
+                and focused.trace_block._expanded
+            ):
+                self._set_hint(_TRACE_HINT)
+            else:
+                self._set_hint(_DEFAULT_HINT)
 
     return RickshawTUI(trace_store=trace_store)
 

@@ -170,7 +170,8 @@ through phases such as `Assembling context…`, `Calling LLM…`,
 turn is taking time.
 
 Once a turn completes, a collapsed trace block appears under the assistant
-message. It shows a brief summary and can be expanded to reveal the full turn
+message. The collapsed summary counts grouped display lines as `steps`.
+Expanding the trace shows a chronological, color-coded timeline of the full turn
 lifecycle.
 
 - **Expand/collapse trace:** `Ctrl+O` toggles the trace block for the selected
@@ -178,10 +179,22 @@ lifecycle.
 - **Navigate turns:** `Ctrl+Up` and `Ctrl+Down` move the selection through the
   transcript; `Esc` or `Ctrl+Down` past the newest turn returns focus to the
   prompt.
-- **Trace contents:** every lifecycle event, including tool-call names, full
-  arguments, and full results; per-retry error messages; reasoning/thinking
-  tokens; and raw request/response metadata. Reasoning and raw metadata are
-  hidden while the trace is collapsed and only visible once expanded.
+- **Navigate inside an expanded trace:** press `Tab` to move focus into the
+  trace, then use the arrow keys to move between events. Press `Enter` on an
+  event to expand it and reveal its raw JSON; press `Enter` again to collapse.
+- **Human-readable view:** expanded traces render as a chronological list of
+  grouped `[answer]` and `[thinking]` blocks (or `[partial answer]` /
+  `[partial thinking]` when a turn is interrupted) with bracket-label summaries
+  for every non-delta event, e.g. `[context]`, `[llm]`, `[tool]`, and
+  `[retry]`. Each line is prefixed with a relative timestamp and color-coded by
+  event type.
+- **Raw JSON toggle:** when a trace is expanded, press `R` to switch the entire
+  trace between the human-readable summary and the canonical raw JSON event
+  payloads, and back.
+- **Long payloads:** long summary values are truncated to fit the terminal and
+  can be expanded inline to show the full value. Very long answer or thinking
+  blocks cap at 30% of the terminal height and can be expanded into a scrollable
+  region.
 - **Persistence:** traces are stored in the same SQLite database as memory
   (`rickshaw_memory.db` by default, or the path passed to `--db-path`) in the
   `traces` and `trace_events` tables. They survive `/clear` and can be queried
