@@ -155,12 +155,13 @@ surfaced.
   `rickshaw_memory.db`) so context carries across sessions.
 - **Slash-commands:** `/help`, `/status` (provider · model · effort), `/settings`
   (show current settings), `/provider [name|add]` (list, switch, or register a
-  provider), `/login` (authenticate the active provider via OAuth), `/clear`,
-  `/effort <level>`, `/model [name]`, `/memory`, `/quit`.
+  provider), `/login` (authenticate the active provider via OAuth), `/clear`
+  (clear the transcript), `/effort <level>`, `/model [name]`, `/memory`,
+  `/keybindings` (open keybinding overlay), `/quit`.
   `/engine` is still accepted as a deprecated alias for `/provider`.
   Type `/` for inline autocomplete.
-- **Keys:** `Esc` interrupts an in-flight turn, `Ctrl+L` clears the transcript,
-  `Ctrl+C` quits.
+- **Keys:** `Esc` interrupts an in-flight turn, closes the slash menu, clears the
+  prompt, or exits a focused trace; `Ctrl+L` redraws the screen; `Ctrl+C` quits.
 
 ### LLM visibility and traces
 
@@ -174,14 +175,24 @@ message. The collapsed summary counts grouped display lines as `steps`.
 Expanding the trace shows a chronological, color-coded timeline of the full turn
 lifecycle.
 
-- **Expand/collapse trace:** `Ctrl+O` toggles the trace block for the selected
-  assistant turn.
-- **Navigate turns:** `Ctrl+Up` and `Ctrl+Down` move the selection through the
-  transcript; `Esc` or `Ctrl+Down` past the newest turn returns focus to the
-  prompt.
-- **Navigate inside an expanded trace:** press `Tab` to move focus into the
-  trace, then use the arrow keys to move between events. Press `Enter` on an
-  event to expand it and reveal its raw JSON; press `Enter` again to collapse.
+The transcript is a single focus ring. From the prompt, `Tab` moves focus to the
+newest turn block; `Shift+Tab` moves to the oldest. Repeated `Tab`/`Shift+Tab`
+step through turn blocks in reverse chronological order and wrap back to the
+prompt. `Enter` on a collapsed turn block expands its trace and focuses the first
+trace event; `Escape` collapses the trace and returns focus to the turn block.
+
+Inside an expanded trace, `Tab`/`Shift+Tab` move between events and continue to
+the next/previous turn block at the boundaries. `Enter` on a focused event
+toggles its full payload (raw JSON for non-delta events, generated content for
+answer/thinking blocks).
+
+- **Navigate turns and events:** `Tab` moves focus forward, `Shift+Tab` moves
+  focus backward. The ring runs `prompt -> newest turn -> older turns -> oldest
+  turn -> prompt`.
+- **Expand/collapse trace:** `Enter` on a collapsed turn block expands it and
+  focuses the first trace event; `Enter` on a focused event expands or collapses
+  that event's payload; `Escape` collapses the trace and returns focus to the
+  turn block.
 - **Human-readable view:** expanded traces render as a chronological list of
   grouped `[answer]` and `[thinking]` blocks (or `[partial answer]` /
   `[partial thinking]` when a turn is interrupted) with bracket-label summaries

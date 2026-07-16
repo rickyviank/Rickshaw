@@ -636,7 +636,8 @@ async def test_app_slash_escape_dismisses_menu():
 
 
 @pytest.mark.asyncio
-async def test_app_slash_tab_completes_arg_command_to_value_picker():
+async def test_app_slash_enter_accepts_arg_command_to_value_picker():
+    """Enter (not Tab) accepts the selected slash command and opens value picker."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     app = tui.make_app(orch, provider, Effort.MEDIUM)
@@ -644,7 +645,7 @@ async def test_app_slash_tab_completes_arg_command_to_value_picker():
     async with app.run_test() as pilot:
         app.query_one("#prompt").value = "/ef"
         await pilot.pause()
-        await pilot.press("tab")
+        await pilot.press("enter")
         await pilot.pause()
         prompt = app.query_one("#prompt")
         menu = app.query_one("#slashmenu")
@@ -2593,18 +2594,24 @@ async def test_trace_block_appears_after_turn():
         assert "steps" in summary
         assert "s" in summary  # duration suffix
 
-        # Expanded details contain the grouped answer block.
-        app.action_toggle_trace()
+        # Tab focuses the newest turn block; Enter expands it.
+        await pilot.press("tab")
         await pilot.pause()
+        assert app.focused is app._turns[-1]["trace"]
+
+        await pilot.press("enter")
+        await pilot.pause()
+        trace = trace_blocks[0]
+        assert trace._expanded
         line_texts = "\n".join(
             str(line._summary_widget.render())
-            for line in trace_blocks[0]._line_widgets
+            for line in trace._line_widgets
             if line._summary_widget is not None
         )
         assert "answer" in line_texts.lower()
         answer_content = "\n".join(
             str(line._content_widget.render())
-            for line in trace_blocks[0]._line_widgets
+            for line in trace._line_widgets
             if line._content_widget is not None
         )
         assert "Hello from fake" in answer_content
@@ -2646,8 +2653,8 @@ async def test_spinner_text_updates_for_events():
 
 
 @pytest.mark.asyncio
-async def test_ctrl_o_expands_and_collapses_trace_block():
-    """Ctrl+O toggles the selected turn's trace block details."""
+async def test_enter_expands_and_escape_collapses_trace_block():
+    """Enter on a focused turn block expands it; Escape collapses it again."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator(function_calling=False)
     app = tui.make_app(orch, provider, Effort.MEDIUM)
@@ -2664,7 +2671,12 @@ async def test_ctrl_o_expands_and_collapses_trace_block():
         trace = app.query_one(".trace-block")
         assert not trace._expanded
 
-        app.action_toggle_trace()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.focused is trace
+        assert tui._TURN_HINT in str(app.query_one("#hint").render())
+
+        await pilot.press("enter")
         await pilot.pause()
         assert trace._expanded
         assert trace.details.display is True
@@ -2683,15 +2695,17 @@ async def test_ctrl_o_expands_and_collapses_trace_block():
         )
         assert "Hello from fake" in answer_content
 
-        app.action_toggle_trace()
+        # Escape inside the expanded trace collapses it and returns focus to the block.
+        await pilot.press("escape")
         await pilot.pause()
         assert not trace._expanded
         assert trace.details.display is False
+        assert app.focused is trace
 
 
 @pytest.mark.asyncio
-async def test_ctrl_up_down_navigates_turns():
-    """Ctrl+Up/Down moves the selection highlight between turns."""
+async def test_tab_shift_tab_navigates_turns():
+    """Tab/Shift+Tab form a focus ring through prompt and turn blocks."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator(function_calling=False)
     app = tui.make_app(orch, provider, Effort.MEDIUM)
@@ -2706,25 +2720,30 @@ async def test_ctrl_up_down_navigates_turns():
                 await pilot.pause(0.02)
 
         assert len(app._turns) == 2
-        assert app._selected_turn_index == -1
+        prompt = app.query_one("#prompt")
+        assert app.focused is prompt
 
-        # Ctrl+Up from prompt selects the most recent turn.
-        app.action_prev_turn()
-        assert app._selected_turn_index == 1
-        assert "selected" in app._turns[1]["user"].classes
-        assert "selected" in app._turns[1]["trace"].classes
+        newest = app._turns[-1]["trace"]
+        oldest = app._turns[0]["trace"]
 
-        # Ctrl+Up again moves to the older turn.
-        app.action_prev_turn()
-        assert app._selected_turn_index == 0
-        assert "selected" not in app._turns[1]["trace"].classes
-        assert "selected" in app._turns[0]["trace"].classes
+        # Tab from prompt focuses the newest turn.
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.focused is newest
 
-        # Ctrl+Down moves back to the newer turn and then to the prompt.
-        app.action_next_turn()
-        assert app._selected_turn_index == 1
-        app.action_next_turn()
-        assert app._selected_turn_index == -1
+        # Tab again focuses the older turn.
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.focused is oldest
+
+        # Shift+Tab moves back to the newer turn and then to the prompt.
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        assert app.focused is newest
+
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        assert app.focused is prompt
 
 
 @pytest.mark.asyncio
@@ -2760,7 +2779,7 @@ async def test_trace_events_persisted_to_store(tmp_path):
 
 @pytest.mark.asyncio
 async def test_trace_r_raw_toggle():
-    """Pressing ``r`` on a focused trace line toggles raw JSON for the block."""
+    """Pressing ``r`` on a focused trace event toggles raw JSON for the block."""
     pytest.importorskip("textual")
 
     def _mock_format(event_records, **kwargs):
@@ -2792,11 +2811,11 @@ async def test_trace_r_raw_toggle():
                 await pilot.pause(0.02)
 
             trace = app.query_one(".trace-block")
-            app.action_toggle_trace()
+            await pilot.press("tab")
+            await pilot.press("enter")
             await pilot.pause()
             line = trace._line_widgets[0]
-            line.focus()
-            await pilot.pause()
+            assert app.focused is line
 
             rendered = str(line._summary_widget.render())
             assert "recall(query)" in rendered
@@ -2814,7 +2833,7 @@ async def test_trace_r_raw_toggle():
 
 @pytest.mark.asyncio
 async def test_trace_per_event_expand():
-    """Enter on a focused trace line expands/collapses its raw payload."""
+    """Enter on a focused trace event toggles that event's content."""
     pytest.importorskip("textual")
 
     def _mock_format(event_records, **kwargs):
@@ -2846,11 +2865,11 @@ async def test_trace_per_event_expand():
                 await pilot.pause(0.02)
 
             trace = app.query_one(".trace-block")
-            app.action_toggle_trace()
+            await pilot.press("tab")
+            await pilot.press("enter")
             await pilot.pause()
             line = trace._line_widgets[0]
-            line.focus()
-            await pilot.pause()
+            assert app.focused is line
 
             assert not line._expanded
             await pilot.press("enter")
@@ -2908,8 +2927,10 @@ async def test_trace_grouped_answer_and_thinking():
                 await pilot.pause(0.02)
 
             trace = app.query_one(".trace-block")
-            app.action_toggle_trace()
+            await pilot.press("tab")
+            await pilot.press("enter")
             await pilot.pause()
+            assert trace._expanded
             line_texts = "\n".join(
                 str(line._summary_widget.render())
                 for line in trace._line_widgets
@@ -2928,7 +2949,7 @@ async def test_trace_grouped_answer_and_thinking():
 
 @pytest.mark.asyncio
 async def test_trace_contextual_hint():
-    """The bottom hint updates when a trace line has focus."""
+    """The bottom hint updates for turn blocks and trace events."""
     pytest.importorskip("textual")
 
     def _mock_format(event_records, **kwargs):
@@ -2960,15 +2981,192 @@ async def test_trace_contextual_hint():
                 await pilot.pause(0.02)
 
             trace = app.query_one(".trace-block")
-            app.action_toggle_trace()
+            await pilot.press("tab")
             await pilot.pause()
-            trace._line_widgets[0].focus()
-            await pilot.pause()
+            hint_text = str(app.query_one("#hint").render())
+            assert tui._TURN_HINT in hint_text
 
+            await pilot.press("enter")
+            await pilot.pause()
+            line = trace._line_widgets[0]
+            assert app.focused is line
             hint_text = str(app.query_one("#hint").render())
             assert tui._TRACE_HINT in hint_text
 
+            # Escape collapses the trace and returns focus to the turn block.
             await pilot.press("escape")
             await pilot.pause()
+            assert not trace._expanded
+            assert app.focused is trace
             hint_text = str(app.query_one("#hint").render())
-            assert tui._DEFAULT_HINT in hint_text
+            assert tui._TURN_HINT in hint_text
+
+
+@pytest.mark.asyncio
+async def test_tab_from_prompt_focuses_newest_turn_block():
+    """Tab from the prompt focuses the newest (most recent) turn block."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+
+        for _ in range(100):
+            if not app._turn_active:
+                break
+            await pilot.pause(0.02)
+
+        assert app.focused is app.query_one("#prompt")
+
+        await pilot.press("tab")
+        await pilot.pause()
+
+        assert app.focused is app._turns[-1]["trace"]
+        assert tui._TURN_HINT in str(app.query_one("#hint").render())
+
+
+@pytest.mark.asyncio
+async def test_tab_moves_between_trace_events():
+    """Tab/Shift+Tab move between events inside an expanded trace."""
+    pytest.importorskip("textual")
+
+    def _mock_format(event_records, **kwargs):
+        return TraceView(
+            summary="2 steps · completed · 0.0s",
+            header_lines=["hi · completed · 0.00s", "fake/fake-model"],
+            lines=[
+                TraceLine(
+                    timestamp="+0.10s",
+                    label="thinking",
+                    summary="(2 Δ)",
+                    content="step one",
+                    expandable=True,
+                    color_class="trace-thinking",
+                ),
+                TraceLine(
+                    timestamp="+0.20s",
+                    label="answer",
+                    summary="(1 Δ)",
+                    content="final answer",
+                    expandable=True,
+                    color_class="trace-answer",
+                ),
+            ],
+            step_count=2,
+        )
+
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+    with patch("rickshaw.tui.format_trace", side_effect=_mock_format):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "hi"
+            await pilot.press("enter")
+
+            for _ in range(100):
+                if not app._turn_active:
+                    break
+                await pilot.pause(0.02)
+
+            trace = app.query_one(".trace-block")
+            await pilot.press("tab")
+            await pilot.press("enter")
+            await pilot.pause()
+
+            first, second = trace._line_widgets[0], trace._line_widgets[1]
+            assert app.focused is first
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.focused is second
+
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app.focused is first
+
+            # Wrapping past the last event returns to the prompt.
+            await pilot.press("tab")
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.focused is app.query_one("#prompt")
+
+
+@pytest.mark.asyncio
+async def test_slash_menu_tab_cycles_and_enter_accepts():
+    """In the slash menu, Tab cycles the highlight and Enter accepts it."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/"
+        await pilot.pause()
+        menu = app.query_one("#slashmenu")
+        assert menu.display is True
+        assert app._menu_index == 0
+
+        # Tab cycles to the next command in the menu.
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app._menu_index == 1
+
+        # Enter runs the highlighted command.
+        await pilot.press("enter")
+        await pilot.pause()
+        rendered = _transcript_text(app)
+        assert "provider" in rendered
+        assert "fake" in rendered
+        assert app.query_one("#slashmenu").display is False
+
+
+@pytest.mark.asyncio
+async def test_keybindings_opens_modal_overlay():
+    """The ``/keybindings`` slash command opens the keybindings modal."""
+    pytest.importorskip("textual")
+    from rickshaw.keybindings_modal import KeybindingsModal
+
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/keybindings"
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, KeybindingsModal)
+
+        # The modal can be dismissed with Escape.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, KeybindingsModal)
+        assert app.query_one("#prompt").has_focus
+
+
+@pytest.mark.asyncio
+async def test_ctrl_l_redraws_without_clearing():
+    """Ctrl+L invokes action_redraw and leaves the transcript intact."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator(function_calling=False)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "hi"
+        await pilot.press("enter")
+
+        for _ in range(100):
+            if not app._turn_active:
+                break
+            await pilot.pause(0.02)
+
+        assert len(app._turns) == 1
+        transcript_before = list(app.query_one("#transcript").children)
+
+        await pilot.press("ctrl+l")
+        await pilot.pause()
+
+        assert len(app._turns) == 1
+        transcript_after = list(app.query_one("#transcript").children)
+        assert len(transcript_after) == len(transcript_before)
+        assert "hi" in _transcript_text(app)
