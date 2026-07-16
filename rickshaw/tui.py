@@ -88,19 +88,19 @@ _DEFAULT_OAUTH_QUIRK = {
 _COMMANDS = {
     "/help": "Show this help.",
     "/status": "Show provider, model, and effort.",
-    "/settings": "Interactive provider/model picker (also shows current settings).",
+    "/settings": "Interactive provider/model/effort picker (also shows current settings).",
     "/models": "List the current provider's available models.",
     "/clear": "Clear the transcript.",
     "/keybindings": "Show the keybinding reference.",
-    "/provider": "/provider [name|add] -- show, switch, or register a provider.",
-    "/effort": "/effort <low|medium|high> -- set reasoning effort.",
-    "/model": "/model [name] -- show or switch the chat model.",
+    "/provider": "Open the provider picker.",
+    "/effort": "Open the effort picker.",
+    "/model": "Open the model picker for the current provider.",
     "/login": "Authenticate (or re-authenticate) the active provider via OAuth.",
     "/memory": "List recently stored memories.",
     "/quit": "Exit.",
     "/exit": "Exit.",
 }
-_ARG_COMMANDS = {"/effort", "/model"}
+_ARG_COMMANDS: set[str] = set()
 _EFFORT_VALUES = ["low", "medium", "high"]
 
 STATUS_BAR_VOCABULARY = ("provider", "model", "effort", "context", "tokens", "price")
@@ -121,6 +121,7 @@ _TURN_HINT = "tab next/prev turn · enter expand trace · esc prompt"
 _TRACE_HINT = "tab next/prev event · enter toggle · esc collapse trace · r raw"
 _MENU_HINT = "tab cycle · enter accept · esc close"
 _OVERLAY_HINT = "esc/q close"
+_PICKER_HINT = "tab/up/down navigate · enter select · esc back/close"
 
 # Map formatter color class names to Textual markup styles.
 _TRACE_STYLE_MAP = {
@@ -423,6 +424,11 @@ def make_app(
     except ImportError as exc:  # pragma: no cover - exercised via message text
         raise SystemExit(_TEXTUAL_MISSING_MSG) from exc
 
+    try:
+        from rickshaw.selection_modal import SelectionModal, SelectionStep
+    except ImportError as exc:  # pragma: no cover - exercised via message text
+        raise SystemExit(_TEXTUAL_MISSING_MSG) from exc
+
     cfg = cfg or RickshawConfig()
 
     # Resolve the trace store: explicit arg > orchestrator's store > in-memory.
@@ -467,11 +473,7 @@ def make_app(
             if event.key == "tab":
                 if app._menu_open and app._menu_items:
                     app._menu_cycle(1)
-                elif (
-                    app._login_state is None
-                    and app._settings_state is None
-                    and app._provider_add_state is None
-                ):
+                elif app._login_state is None and app._provider_add_state is None:
                     app._focus_ring_step()
                 event.prevent_default()
                 event.stop()
@@ -479,11 +481,7 @@ def make_app(
             if event.key == "shift+tab":
                 if app._menu_open and app._menu_items:
                     app._menu_cycle(-1)
-                elif (
-                    app._login_state is None
-                    and app._settings_state is None
-                    and app._provider_add_state is None
-                ):
+                elif app._login_state is None and app._provider_add_state is None:
                     app._focus_ring_step(reverse=True)
                 event.prevent_default()
                 event.stop()
@@ -971,10 +969,10 @@ def make_app(
             self._turn_active = False
             self._has_turns = False
             self._provider_add_state: dict | None = None
-            self._settings_state: dict | None = None
             self._login_state: dict | None = None
             self._active_profile_name: str | None = None
             self._effort_note_shown: set[str] = set()
+            self._oauth_continue: dict | None = None
             self._turn_seq = 0
             self._indicator: Static | None = None
             self._indicator_timer = None
@@ -1017,7 +1015,7 @@ def make_app(
             self._render_welcome()
             if self.provider is None:
                 self._write("no provider selected", cls="meta")
-                self._start_provider_picker()
+                self._open_settings_modal("provider")
             else:
                 caps = self.provider.capabilities()
                 model = getattr(self.provider, "_model", "") or self.provider.name
@@ -1087,33 +1085,259 @@ def make_app(
 
         # ---- on-launch provider picker ---------------------------------
 
-        def _start_provider_picker(self) -> None:
-            """Display the provider picker (builtins + configured)."""
+        # ---- selection modal -------------------------------------------
+
+        def _open_settings_modal(
+            self, initial_step: str = "provider", provider_name: str | None = None,
+            model_name: str | None = None,
+        ) -> None:
+            """Open the multi-step provider/model/effort picker."""
             self._close_menu()
-            builtin_names = _get_builtin_provider_names()
-            configured_names = sorted(self.cfg.providers)
-            all_names = sorted(set(builtin_names) | set(configured_names))
-            if not all_names:
-                self._write("No providers available.", "warn")
+            if initial_step == "provider":
+                step = self._build_provider_step()
+            elif initial_step == "model":
+                name = provider_name or (self.provider.name if self.provider else None)
+                if name is None:
+                    self._open_settings_modal("provider")
+                    return
+                step = self._build_model_step(name)
+            elif initial_step == "effort":
+                name = provider_name or (self.provider.name if self.provider else None)
+                if name is None:
+                    self._open_settings_modal("provider")
+                    return
+                step = self._build_effort_step(name, model_name)
+            else:
                 return
-            self._write("", "meta")
-            self._write("  Pick a provider (enter name, Esc to cancel):", "meta")
+
+            def _on_close(result: dict[str, str] | None) -> None:
+                self._set_hint(_DEFAULT_HINT)
+                if result:
+                    self._apply_selections(result)
+
+            self.push_screen(SelectionModal(step, self._on_modal_advance), _on_close)
+            self._set_hint(_PICKER_HINT)
+
+        def _build_provider_step(self) -> "SelectionStep":
+            """Build the provider selection step from built-ins."""
+            names = _get_builtin_provider_names()
             current = (
                 self._active_profile_name or self.provider.name
-            ) if self.provider else ""
-            for name in all_names:
+            ) if self.provider else None
+            options: list[tuple[str, str]] = []
+            for name in names:
                 info = _builtin_provider_info(name)
-                oauth_tag = ""
-                if info and info.oauth:
-                    oauth_tag = " (oauth)"
-                marker = "\u2666" if name == current else " "
-                self._write(f"    {name:<16} {marker}{oauth_tag}", "meta")
-            self._settings_state = {
-                "step": "provider",
-                "providers": all_names,
-                "on_launch": self.provider is None,
-            }
-            self._set_hint("provider name (Enter to submit, Esc to cancel)")
+                protocol = info.protocol if info else "openai"
+                label = f"{name:<16} {protocol}"
+                options.append((name, label))
+            return SelectionStep(
+                step_id="provider",
+                title="Select provider",
+                options=sorted(options),
+                current=current,
+                hint="tab/up/down navigate · enter select · esc close",
+            )
+
+        def _build_model_step(self, provider_name: str) -> "SelectionStep":
+            """Build the model selection step with an async loader."""
+            profile = self.cfg.providers.get(provider_name)
+            if profile is None:
+                raise ValueError(f"no profile for {provider_name!r}")
+
+            current_model = ""
+            if self.provider is not None and (
+                self._active_profile_name or self.provider.name
+            ) == provider_name:
+                current_model = getattr(self.provider, "_model", "") or ""
+
+            def _load_models() -> list[tuple[str, str]]:
+                temp = build_provider_from_profile(
+                    provider_name, profile,
+                    embedding_model=self.cfg.openai_embedding_model,
+                )
+                if profile.is_local_endpoint():
+                    temp.validate()
+                models = temp.available_models()
+                out: list[tuple[str, str]] = []
+                for m in sorted(models):
+                    info = _find_model_info(provider_name, m)
+                    parts = [m]
+                    if info:
+                        if info.context_window:
+                            parts.append(f"{info.context_window // 1000}k")
+                        pin = getattr(info.pricing, "input", 0.0) or 0.0
+                        pout = getattr(info.pricing, "output", 0.0) or 0.0
+                        if pin > 0 or pout > 0:
+                            parts.append(f"${pin}/{pout}")
+                    out.append((m, "  ".join(parts)))
+                return out
+
+            return SelectionStep(
+                step_id="model",
+                title=f"Select model · {provider_name}",
+                loader=_load_models,
+                current=current_model or None,
+                empty_message=f"No models available for {provider_name}.",
+            )
+
+        def _build_effort_step(
+            self, provider_name: str, model_name: str | None = None,
+        ) -> "SelectionStep":
+            """Build the effort selection step for the active provider/model."""
+            provider: LLMProvider | None = None
+            if model_name:
+                try:
+                    provider = _rebuild_provider(provider_name, self.cfg, model_name)
+                except Exception:
+                    provider = None
+            if provider is None and self.provider is not None:
+                if self.provider.name == provider_name:
+                    provider = self.provider
+            current = self.orchestrator.effort.value
+            if provider is None:
+                options = [(e.value, e.value) for e in Effort]
+                title = "Select effort"
+            else:
+                levels = provider.capabilities().effort_levels
+                if levels:
+                    options = [(e.value, e.value) for e in levels]
+                else:
+                    options = [(e.value, e.value) for e in Effort]
+                if len(options) == 1:
+                    title = "Select effort (only level supported)"
+                else:
+                    title = "Select effort"
+            return SelectionStep(
+                step_id="effort",
+                title=title,
+                options=options,
+                current=current,
+                hint="tab/up/down navigate · enter select · esc back",
+            )
+
+        def _on_modal_advance(
+            self,
+            step_id: str,
+            value: str,
+            selections: dict[str, str],
+            modal: "SelectionModal",
+        ) -> "SelectionStep | None":
+            """Advance to the next step or finish the modal flow."""
+            if step_id == "provider":
+                provider_name = value
+                info = _builtin_provider_info(provider_name)
+                if info and info.oauth and not self._provider_has_credential(provider_name, info):
+                    self._oauth_continue = {"selections": selections, "mode": "settings"}
+                    self._start_oauth_login(provider_name, info)
+                    return None
+                return self._build_model_step(provider_name)
+            if step_id == "model":
+                return self._build_effort_step(
+                    selections.get("provider", ""), selections.get("model"),
+                )
+            return None
+
+        def _provider_has_credential(self, provider_id: str, info) -> bool:
+            """Return True when the provider has an env key or stored credential."""
+            for key in info.env_keys or []:
+                if os.environ.get(key):
+                    return True
+            return _bridge.has_stored_credential(provider_id)
+
+        def _apply_selections(self, selections: dict[str, str]) -> None:
+            """Apply the final provider/model/effort selections."""
+            provider_name = selections.get("provider")
+            model_name = selections.get("model")
+            effort_value = selections.get("effort")
+            # /model and /effort start mid-flow; fall back to the current provider/model.
+            if provider_name is None and self.provider is not None:
+                provider_name = self.provider.name
+            if model_name is None and self.provider is not None:
+                model_name = getattr(self.provider, "_model", "") or self.provider.name
+            if not provider_name or not model_name:
+                return
+
+            current_name = self.provider.name if self.provider else None
+            current_model = (
+                getattr(self.provider, "_model", "") or current_name
+            ) if self.provider else None
+            if (
+                provider_name == current_name
+                and model_name == current_model
+                and effort_value
+            ):
+                new_effort = _EFFORT_NAMES.get(effort_value)
+                if new_effort is not None:
+                    self.orchestrator.effort = new_effort
+                    self.effort = new_effort
+                    settings = load_settings()
+                    settings["provider"] = provider_name
+                    settings["model"] = model_name
+                    settings["effort"] = new_effort.value
+                    save_settings(settings)
+                    self._write(
+                        f"{provider_name} · {model_name} · effort {new_effort.value}",
+                        "meta",
+                    )
+                    self.query_one("#prompt", PromptArea).focus()
+                    self._update_status_bar()
+                return
+
+            profile = self.cfg.providers.get(provider_name)
+            if profile is None:
+                self._write(f"No profile for {provider_name!r}; use /provider add.", "warn")
+                return
+
+            try:
+                new_provider = _rebuild_provider(provider_name, self.cfg, model_name)
+            except Exception as exc:
+                logger.exception("Failed to switch provider/model via modal")
+                self._write(
+                    f"Cannot switch: {_local_hint_message(provider_name, profile, exc)}",
+                    "warn",
+                )
+                return
+
+            self.provider = new_provider
+            self.orchestrator.provider = new_provider
+            self._active_profile_name = provider_name
+
+            if effort_value:
+                new_effort = _EFFORT_NAMES.get(effort_value)
+                if new_effort is not None:
+                    self.orchestrator.effort = new_effort
+                    self.effort = new_effort
+
+            # Effort reconciliation.
+            caps = new_provider.capabilities()
+            old_effort = self.orchestrator.effort
+            if profile.is_local_endpoint():
+                self._note_local_effort(provider_name)
+            elif caps.effort_levels and old_effort not in caps.effort_levels:
+                default_effort = Effort.MEDIUM
+                self.orchestrator.effort = default_effort
+                self.effort = default_effort
+                self._write(
+                    f"note: {provider_name} does not support effort "
+                    f"{old_effort.value}. Reset to medium.",
+                    "warn",
+                )
+
+            if profile.is_local_endpoint():
+                self._persist_local_model(provider_name, model_name)
+            settings = load_settings()
+            settings["provider"] = provider_name
+            settings["model"] = model_name
+            settings["effort"] = self.orchestrator.effort.value
+            save_settings(settings)
+
+            self._write(
+                f"{provider_name} · {model_name} · effort "
+                f"{self.orchestrator.effort.value}",
+                "meta",
+            )
+            self.query_one("#prompt", PromptArea).focus()
+            self._update_status_bar()
 
         # ---- transcript helpers ----------------------------------------
 
@@ -1330,7 +1554,6 @@ def make_app(
         def _update_menu_from_prompt(self, text: str) -> None:
             if (
                 self._login_state is not None
-                or self._settings_state is not None
                 or self._provider_add_state is not None
                 or self._turn_active
             ):
@@ -1397,9 +1620,6 @@ def make_app(
             # Wizard intercepts all input while active.
             if self._login_state is not None:
                 self._login_step(value)
-                return
-            if self._settings_state is not None:
-                self._settings_step(value)
                 return
             if self._provider_add_state is not None:
                 self._provider_add_step(value)
@@ -1474,8 +1694,6 @@ def make_app(
         def _history_nav_allowed(self, direction: str) -> bool:
             if self._login_state is not None:
                 return False
-            if self._settings_state is not None:
-                return False
             if self._provider_add_state is not None:
                 return False
             if self._menu_open:
@@ -1536,15 +1754,26 @@ def make_app(
             elif cmd == "/keybindings":
                 self._cmd_keybindings()
             elif cmd == "/effort":
-                self._cmd_effort(arg)
+                if arg:
+                    self._write("Usage: /effort", "warn")
+                else:
+                    self._cmd_effort()
             elif cmd == "/model":
-                self._cmd_model(arg)
+                if arg:
+                    self._write("Usage: /model", "warn")
+                else:
+                    self._cmd_model()
             elif cmd == "/settings":
                 self._cmd_settings()
             elif cmd == "/models":
                 self._cmd_models()
             elif cmd in ("/provider", "/engine"):
-                self._cmd_provider(arg)
+                if arg.lower() == "add":
+                    self._cmd_provider_add_start()
+                elif arg:
+                    self._write("Usage: /provider or /provider add", "warn")
+                else:
+                    self._cmd_provider()
             elif cmd == "/login":
                 self._cmd_login()
             elif cmd == "/memory":
@@ -1601,102 +1830,16 @@ def make_app(
                 return str(exc)
             return _local_hint_message(local[0], local[1], exc)
 
-        def _cmd_effort(self, arg: str) -> None:
-            level = arg.lower()
-            if level not in _EFFORT_NAMES:
-                self._write(f"Invalid effort {arg!r}. Use: low, medium, high.", "warn")
-                return
-            new_effort = _EFFORT_NAMES[level]
-            caps = self.provider.capabilities()
-            if caps.effort_levels and new_effort not in caps.effort_levels:
-                supported = ", ".join(e.value for e in caps.effort_levels)
-                self._write(
-                    f"{self.provider.name} does not support effort "
-                    f"{new_effort.value}. Supported: {supported}.",
-                    "warn",
-                )
-                return
-            self.orchestrator.effort = new_effort
-            self.effort = new_effort
-            settings = load_settings()
-            settings["effort"] = new_effort.value
-            save_settings(settings)
-            self._write(f"effort · {new_effort.value}", "meta")
-            self._write(f"effort · {new_effort.value}", "meta")
-            self._update_status_bar()
+        def _cmd_effort(self) -> None:
+            """Open the effort picker for the current provider/model."""
+            self._close_menu()
+            model = getattr(self.provider, "_model", "") or None
+            self._open_settings_modal("effort", model_name=model)
 
-        def _cmd_model(self, arg: str) -> None:
-            if not arg:
-                # List the current provider's available models.
-                model = getattr(self.provider, "_model", "") or "(unknown)"
-                self._write(
-                    f"current · {self.provider.name} ({model})", "meta",
-                )
-                self._write("", "meta")
-                try:
-                    models = self.provider.available_models()
-                except Exception as exc:
-                    logger.exception("Failed to list models for /model")
-                    self._write(
-                        f"Cannot list models: {self._exc_with_local_hint(exc)}",
-                        "warn",
-                    )
-                    return
-                self._write("  available models:", "meta")
-                for m in models:
-                    marker = "♦" if m == model else " "
-                    self._write(f"    {m:<32} {marker}", "meta")
-                return
-
-            # Strict validation: only allow models from the current provider.
-            try:
-                valid_models = self.provider.available_models()
-            except Exception as exc:
-                logger.exception("Failed to validate model %r", arg)
-                self._write(
-                    f"Cannot validate model: {self._exc_with_local_hint(exc)}",
-                    "warn",
-                )
-                return
-
-            if arg not in valid_models:
-                display = ", ".join(valid_models)
-                self._write(
-                    f"Unknown model {arg!r} for {self.provider.name}. "
-                    f"Available: {display}",
-                    "warn",
-                )
-                return
-
-            try:
-                new_provider = _rebuild_provider(self.provider.name, self.cfg, arg)
-            except Exception as exc:
-                logger.exception("Failed to switch model to %r", arg)
-                self._write(f"Cannot switch model: {exc}", "warn")
-                return
-            self.provider = new_provider
-            self.orchestrator.provider = new_provider
-
-            # Effort reconciliation: reset to medium if unsupported.
-            caps = new_provider.capabilities()
-            old_effort = self.orchestrator.effort
-            if caps.effort_levels and old_effort not in caps.effort_levels:
-                default_effort = Effort.MEDIUM
-                self.orchestrator.effort = default_effort
-                self.effort = default_effort
-                self._write(
-                    f"note: {arg} does not support effort "
-                    f"{old_effort.value}. Reset to medium.",
-                    "warn",
-                )
-
-            settings = load_settings()
-            settings["model"] = arg
-            settings["effort"] = self.orchestrator.effort.value
-            save_settings(settings)
-            self._write(f"model · {arg}", "meta")
-            self._write(f"model · {arg}", "meta")
-            self._update_status_bar()
+        def _cmd_model(self) -> None:
+            """Open the model picker for the current provider."""
+            self._close_menu()
+            self._open_settings_modal("model")
 
         def _cmd_memory(self) -> None:
             try:
@@ -1734,248 +1877,17 @@ def make_app(
                 self._write(f"    {m:<32} {marker}", "meta")
 
         def _cmd_settings(self) -> None:
-            """Interactive provider/model picker with settings header."""
+            """Open the interactive provider/model/effort picker."""
             self._close_menu()
-            prov_name = self.provider.name if self.provider else "(none)"
-            model = (getattr(self.provider, "_model", "") or prov_name) if self.provider else "(none)"
-            settings = load_settings()
-            emb_prov = settings.get(
-                "embedding_provider",
-                self.cfg.embedding_provider or "openai",
-            )
-            emb_model = settings.get(
-                "embedding_model", self.cfg.openai_embedding_model,
-            )
-            lines = [
-                "Settings",
-                "\u2500" * 44,
-                f"  provider         {prov_name}",
-                f"  model            {model}",
-                f"  effort           {self.orchestrator.effort.value}",
-                f"  embedding        {emb_prov} / {emb_model}",
-                "\u2500" * 44,
-            ]
-            for line in lines:
-                self._write(line, "meta")
+            self._open_settings_modal("provider")
 
-            self._start_provider_picker()
-
-        def _settings_step(self, value: str) -> None:
-            """Process one step of the interactive /settings wizard."""
-            state = self._settings_state
-            if state is None:
-                return
-
-            if state["step"] == "provider":
-                if not value:
-                    self._write("(cancelled)", "warn")
-                    self._settings_state = None
-                    self._set_hint(_DEFAULT_HINT)
-                    return
-                chosen = value.strip()
-                all_providers = state["providers"]
-                if chosen not in all_providers:
-                    available = ", ".join(all_providers)
-                    self._write(
-                        f"Unknown provider {chosen!r}. Available: {available}",
-                        "warn",
-                    )
-                    return
-                self._write(f"  provider: {chosen}", "meta")
-
-                # Check if this is an OAuth-capable builtin that needs login.
-                info = _builtin_provider_info(chosen)
-                if info and info.oauth:
-                    if "oauth" in info.auth_methods:
-                        self._settings_state = None
-                        self._set_hint(_DEFAULT_HINT)
-                        self._start_oauth_login(chosen, info)
-                        return
-
-                # Build a temporary provider to list its models.
-                profile = self.cfg.providers.get(chosen)
-                if profile is None:
-                    self._write(f"No profile for {chosen!r}; use /provider add.", "warn")
-                    self._settings_state = None
-                    self._set_hint(_DEFAULT_HINT)
-                    return
-                try:
-                    temp = build_provider_from_profile(
-                        chosen, profile,
-                        embedding_model=self.cfg.openai_embedding_model,
-                    )
-                    if profile.is_local_endpoint():
-                        temp.validate()
-                    models = temp.available_models()
-                except Exception as exc:
-                    logger.exception("Failed to list models for provider %r", chosen)
-                    self._write(
-                        f"Cannot list models for {chosen}: "
-                        f"{_local_hint_message(chosen, profile, exc)}",
-                        "warn",
-                    )
-                    self._settings_state = None
-                    self._set_hint(_DEFAULT_HINT)
-                    return
-
-                if not models:
-                    msg = f"No models available for {chosen}."
-                    if profile.is_local_endpoint():
-                        msg = f"{msg} — {local_no_models_hint(chosen)}"
-                    self._write(msg, "warn")
-                    self._settings_state = None
-                    self._set_hint(_DEFAULT_HINT)
-                    return
-
-                # Local model resolution (D4): re-verify the persisted model
-                # and adopt silently when the server offers exactly one.
-                if profile.is_local_endpoint():
-                    if profile.model and profile.model not in models:
-                        self._write(
-                            f"model {profile.model!r} is no longer available "
-                            f"on {chosen}",
-                            "meta",
-                        )
-                    if len(models) == 1:
-                        self._write(f"  model: {models[0]}", "meta")
-                        self._settings_apply(chosen, models[0])
-                        self._settings_state = None
-                        self._set_hint(_DEFAULT_HINT)
-                        return
-
-                current_model = (
-                    getattr(self.provider, "_model", "")
-                    if self.provider
-                    and chosen == (self._active_profile_name or self.provider.name)
-                    else ""
-                )
-                self._start_model_picker(chosen, models, current_model)
-
-            elif state["step"] == "model":
-                if not value:
-                    self._write("(cancelled)", "warn")
-                    self._settings_state = None
-                    self._set_hint(_DEFAULT_HINT)
-                    return
-                model_name = value.strip()
-                valid_models = state["valid_models"]
-                chosen_provider = state["chosen_provider"]
-                if model_name not in valid_models:
-                    display = ", ".join(valid_models)
-                    self._write(
-                        f"Unknown model {model_name!r}. Available: {display}",
-                        "warn",
-                    )
-                    return
-                self._write(f"  model: {model_name}", "meta")
-
-                # Apply the provider + model switch.
-                self._settings_apply(chosen_provider, model_name)
-                self._settings_state = None
-                self._set_hint(_DEFAULT_HINT)
-
-        def _start_model_picker(
-            self, chosen: str, models: list[str], current_model: str,
-        ) -> None:
-            """Show the model-picker step (shared by /settings and /provider)."""
-            self._write("", "meta")
-            self._write("  Pick a model (enter name, Esc to cancel):", "meta")
-            for m in models:
-                marker = "\u2666" if m == current_model else " "
-                self._write(f"    {m:<32} {marker}", "meta")
-            self._settings_state = {
-                "step": "model",
-                "chosen_provider": chosen,
-                "valid_models": models,
-            }
-            self._set_hint("model name (Enter to submit, Esc to cancel)")
-
-        def _settings_apply(self, provider_name: str, model_name: str) -> None:
-            """Apply provider + model selection from /settings wizard."""
-            profile = self.cfg.providers[provider_name]
-            try:
-                new_provider = _rebuild_provider(
-                    provider_name, self.cfg, model_name,
-                )
-            except Exception as exc:
-                logger.exception("Failed to switch provider/model via /settings")
-                self._write(
-                    f"Cannot switch: {_local_hint_message(provider_name, profile, exc)}",
-                    "warn",
-                )
-                return
-            self.provider = new_provider
-            self.orchestrator.provider = new_provider
-            self._active_profile_name = provider_name
-
-            # Effort reconciliation.
-            caps = new_provider.capabilities()
-            old_effort = self.orchestrator.effort
-            if profile.is_local_endpoint():
-                self._note_local_effort(provider_name)
-            elif caps.effort_levels and old_effort not in caps.effort_levels:
-                default_effort = Effort.MEDIUM
-                self.orchestrator.effort = default_effort
-                self.effort = default_effort
-                self._write(
-                    f"note: {provider_name} does not support effort "
-                    f"{old_effort.value}. Reset to medium.",
-                    "warn",
-                )
-
-            if profile.is_local_endpoint():
-                self._persist_local_model(provider_name, model_name)
-            settings = load_settings()
-            settings["provider"] = provider_name
-            settings["model"] = model_name
-            settings["effort"] = self.orchestrator.effort.value
-            save_settings(settings)
-
-            self._write(
-                f"{provider_name} \u00b7 {model_name} \u00b7 effort "
-                f"{self.orchestrator.effort.value}",
-                "meta",
-            )
-            self._write(
-                f"{provider_name} · {model_name} · effort "
-                f"{self.orchestrator.effort.value}",
-                "meta",
-            )
-            self.query_one("#prompt", PromptArea).focus()
-            self._update_status_bar()
-
-        def _cmd_provider(self, arg: str) -> None:
-            """Show, switch, or register providers."""
-            if not arg:
-                self._cmd_provider_list()
-            elif arg.lower() == "add":
-                self._cmd_provider_add_start()
-            else:
-                self._cmd_provider_switch(arg)
-
-        def _cmd_provider_list(self) -> None:
-            """List available providers with the active one marked."""
-            active = self._active_profile_name or self.provider.name
-            model = getattr(self.provider, "_model", "") or self.provider.name
-            self._write(
-                f"current \u00b7 {active} ({model})", "meta",
-            )
-            self._write("", "meta")
-            self._write("  available providers:", "meta")
-            for name in sorted(self.cfg.providers):
-                profile = self.cfg.providers[name]
-                marker = "\u2666" if name == active else " "
-                self._write(
-                    f"    {name:<16} {marker} {profile.api_key_env}", "meta",
-                )
-            self._write("", "meta")
-            self._write(
-                "  /provider <name> to switch \u00b7 /provider add to register",
-                "meta",
-            )
+        def _cmd_provider(self) -> None:
+            """Open the provider picker."""
+            self._close_menu()
+            self._open_settings_modal("provider")
 
         def _cmd_provider_switch(self, name: str) -> None:
-            """Switch the active provider to *name*."""
+            """Switch the active provider to *name* (legacy path for custom providers)."""
             profile = self.cfg.providers.get(name)
             if profile is None:
                 available = ", ".join(sorted(self.cfg.providers))
@@ -2030,11 +1942,6 @@ def make_app(
                 f"{self.orchestrator.effort.value}",
                 "meta",
             )
-            self._write(
-                f"{name} · {model} · effort "
-                f"{self.orchestrator.effort.value}",
-                "meta",
-            )
             self._update_status_bar()
 
         def _note_local_effort(self, name: str) -> None:
@@ -2084,11 +1991,10 @@ def make_app(
                 )
                 return False
             if len(models) == 1:
-                provider._model = models[0]
-                self._persist_local_model(name, models[0])
-                self._write(f"model · {models[0]}", "meta")
-                return True
-            self._start_model_picker(name, models, "")
+                # Per the modal picker UX (D7), even a single model is shown
+                # for selection.
+                pass
+            self._open_settings_modal("model", name)
             return False
 
         def _persist_local_model(self, name: str, model: str) -> None:
@@ -2390,6 +2296,18 @@ def make_app(
             settings["provider"] = provider_id
             save_settings(settings)
 
+            # If the picker is waiting on OAuth, continue the modal flow.
+            if self._oauth_continue is not None:
+                selections = self._oauth_continue.get("selections", {})
+                self._oauth_continue = None
+                step = self._build_model_step(provider_id)
+                self.push_screen(
+                    SelectionModal(step, self._on_modal_advance),
+                    self._on_oauth_settings_close,
+                )
+                self._set_hint(_PICKER_HINT)
+                return
+
             model = getattr(new_provider, "_model", "") or provider_id
             self._write(
                 f"{provider_id} · {model} · effort "
@@ -2397,6 +2315,12 @@ def make_app(
                 "meta",
             )
             self._update_status_bar()
+
+        def _on_oauth_settings_close(self, result: dict[str, str] | None) -> None:
+            """Apply selections after OAuth continues the settings flow."""
+            self._set_hint(_DEFAULT_HINT)
+            if result:
+                self._apply_selections(result)
 
         def _cmd_login(self) -> None:
             """Authenticate (or re-authenticate) the active provider via OAuth."""
@@ -2655,11 +2579,6 @@ def make_app(
                 self._write("(cancelled)", "warn")
                 self._set_hint(_DEFAULT_HINT)
                 return
-            if self._settings_state is not None:
-                self._settings_state = None
-                self._write("(cancelled)", "warn")
-                self._set_hint(_DEFAULT_HINT)
-                return
             if self._provider_add_state is not None:
                 self._provider_add_state = None
                 self._write("(cancelled)", "warn")
@@ -2759,7 +2678,6 @@ def make_app(
                 return
             if (
                 self._login_state is not None
-                or self._settings_state is not None
                 or self._provider_add_state is not None
             ):
                 return

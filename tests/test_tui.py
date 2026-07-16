@@ -137,6 +137,51 @@ def _fake_model_info():
     )
 
 
+def _modal_is_open(app) -> bool:
+    return type(app.screen).__name__ == "SelectionModal"
+
+
+def _modal_title_text(app) -> str:
+    from textual.widgets import Static
+
+    try:
+        title = app.screen.query_one(".title", Static)
+    except Exception:
+        return ""
+    return str(title.render())
+
+
+def _modal_rows_text(app) -> str:
+    from textual.widgets import Static
+
+    try:
+        rows = app.screen.query_one(".rows", Static)
+    except Exception:
+        return ""
+    return str(rows.render())
+
+
+def _modal_footer_text(app) -> str:
+    from textual.widgets import Static
+
+    try:
+        footer = app.screen.query_one(".footer", Static)
+    except Exception:
+        return ""
+    return str(footer.render())
+
+
+def _fake_builtin_info(protocol: str = "openai", oauth=None, env_keys=None):
+    return SimpleNamespace(
+        protocol=protocol,
+        oauth=oauth,
+        env_keys=env_keys or [],
+        models=[],
+        base_url="",
+        id="",
+    )
+
+
 # --- module / wiring tests (no Textual needed) -------------------------------
 
 
@@ -597,27 +642,28 @@ async def test_app_slash_filters_command_menu():
 
 
 @pytest.mark.asyncio
-async def test_app_slash_effort_value_picker_applies_selection():
+async def test_app_slash_effort_opens_modal_and_selects():
+    """``/effort`` opens the effort picker modal; Enter applies the choice."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     orch.effort = Effort.LOW
     app = tui.make_app(orch, provider, Effort.LOW)
 
     async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/effort "
+        app.query_one("#prompt").value = "/effort"
+        await pilot.press("enter")
         await pilot.pause()
-        menu = app.query_one("#slashmenu")
-        rendered = str(menu.render())
-        assert menu.display is True
-        assert "low" in rendered
-        assert "medium" in rendered
-        assert "high" in rendered
+        assert _modal_is_open(app)
+        assert "Select effort" in _modal_title_text(app)
+        assert "low" in _modal_rows_text(app)
+        assert "medium" in _modal_rows_text(app)
+        assert "high" in _modal_rows_text(app)
 
         await pilot.press("down")
         await pilot.press("enter")
         await pilot.pause()
+        assert not _modal_is_open(app)
         assert orch.effort == Effort.MEDIUM
-        assert app.query_one("#slashmenu").display is False
 
 
 @pytest.mark.asyncio
@@ -636,8 +682,8 @@ async def test_app_slash_escape_dismisses_menu():
 
 
 @pytest.mark.asyncio
-async def test_app_slash_enter_accepts_arg_command_to_value_picker():
-    """Enter (not Tab) accepts the selected slash command and opens value picker."""
+async def test_app_slash_enter_runs_effort_command_and_opens_modal():
+    """Enter accepts an abbreviated slash command and opens its modal."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     app = tui.make_app(orch, provider, Effort.MEDIUM)
@@ -647,14 +693,8 @@ async def test_app_slash_enter_accepts_arg_command_to_value_picker():
         await pilot.pause()
         await pilot.press("enter")
         await pilot.pause()
-        prompt = app.query_one("#prompt")
-        menu = app.query_one("#slashmenu")
-        rendered = str(menu.render())
-        assert prompt.value == "/effort "
-        assert menu.display is True
-        assert "low" in rendered
-        assert "medium" in rendered
-        assert "high" in rendered
+        assert _modal_is_open(app)
+        assert "Select effort" in _modal_title_text(app)
 
 
 @pytest.mark.asyncio
@@ -815,7 +855,8 @@ async def test_prompt_esc_clears_when_idle():
 
 
 @pytest.mark.asyncio
-async def test_wizard_advances_on_textarea():
+async def test_settings_opens_provider_modal():
+    """``/settings`` opens the provider picker modal."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = RickshawConfig()
@@ -825,25 +866,15 @@ async def test_wizard_advances_on_textarea():
     )
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()):
         async with app.run_test() as pilot:
             app.query_one("#prompt").value = "/settings"
             await pilot.press("enter")
             await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "Pick a provider" in rendered
-
-            app.query_one("#prompt").value = "fake"
-            await pilot.press("enter")
-            await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "Pick a model" in rendered
+            assert _modal_is_open(app)
+            assert "Select provider" in _modal_title_text(app)
+            assert "fake" in _modal_rows_text(app)
 
 
 @pytest.mark.asyncio
@@ -1119,40 +1150,50 @@ async def test_app_history_recall_and_return_to_draft():
 
 
 @pytest.mark.asyncio
-async def test_app_history_navigation_is_blocked_during_wizard():
+async def test_modal_navigation_uses_rows_not_history():
+    """Arrow keys navigate the modal options, not command history."""
     pytest.importorskip("textual")
-    append_history("saved history entry")
     orch, provider, _memory = _make_orchestrator()
     app = tui.make_app(orch, provider, Effort.MEDIUM)
+    append_history("saved history entry")
 
     async with app.run_test() as pilot:
-        app._settings_state = {"step": "provider", "providers": ["fake"], "on_launch": False}
-        prompt = app.query_one("#prompt")
-        prompt.value = "draft"
-        prompt.focus()
-
-        await pilot.press("up")
-
-        assert app.query_one("#prompt").value == "draft"
+        app.query_one("#prompt").value = "/effort"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert _modal_is_open(app)
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not _modal_is_open(app)
+        assert orch.effort == Effort.HIGH
 
 
 @pytest.mark.asyncio
-async def test_app_effort_command_updates_orchestrator():
+async def test_app_effort_command_updates_orchestrator_via_modal():
+    """``/effort`` opens the effort picker and a selection updates effort."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     app = tui.make_app(orch, provider, Effort.MEDIUM)
 
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt")
-        prompt.value = "/effort low"
+        app.query_one("#prompt").value = "/effort"
         await pilot.press("enter")
         await pilot.pause()
+        assert _modal_is_open(app)
+        assert "Select effort" in _modal_title_text(app)
+
+        await pilot.press("up")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not _modal_is_open(app)
         assert orch.effort == Effort.LOW
 
 
 @pytest.mark.asyncio
-async def test_app_settings_command_shows_header():
-    """``/settings`` prints settings header and starts the interactive picker."""
+async def test_app_settings_command_opens_provider_modal():
+    """``/settings`` opens the provider selection modal."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = RickshawConfig()
@@ -1162,42 +1203,33 @@ async def test_app_settings_command_shows_header():
     )
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/settings"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "Settings" in rendered
-        assert "provider" in rendered
-        assert "Pick a provider" in rendered
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/settings"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert _modal_is_open(app)
+            assert "Select provider" in _modal_title_text(app)
+            assert "fake" in _modal_rows_text(app)
 
 
 @pytest.mark.asyncio
-async def test_app_provider_list_shows_providers():
-    """``/provider`` (no arg) lists available providers."""
+async def test_app_provider_command_opens_provider_modal():
+    """``/provider`` opens the built-in provider picker modal."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
-    cfg = RickshawConfig()
-    cfg.providers["fake"] = ProviderProfile(
-        base_url="", model="fake-model",
-        api_key_env="FAKE_KEY", wire_format="openai",
-    )
-    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
 
-    async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/provider"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "available providers" in rendered
-        assert "fake" in rendered
-        assert "FAKE_KEY" in rendered
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/provider"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert _modal_is_open(app)
+            assert "Select provider" in _modal_title_text(app)
+            assert "fake" in _modal_rows_text(app)
 
 
 @pytest.mark.asyncio
@@ -1259,8 +1291,8 @@ async def test_app_warn_missing_metadata_writes_warn_statics():
 
 
 @pytest.mark.asyncio
-async def test_app_effort_rejected_when_unsupported():
-    """Effort change is rejected when the provider doesn't support it."""
+async def test_app_effort_modal_lists_only_supported_levels():
+    """The effort picker only shows levels supported by the provider."""
     pytest.importorskip("textual")
 
     class _LimitedProvider(_FakeProvider):
@@ -1278,21 +1310,19 @@ async def test_app_effort_rejected_when_unsupported():
     app = tui.make_app(orch, provider, Effort.MEDIUM)
 
     async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/effort high"
+        app.query_one("#prompt").value = "/effort"
         await pilot.press("enter")
         await pilot.pause()
-        # Effort should NOT have changed since HIGH is unsupported.
-        assert orch.effort == Effort.MEDIUM
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "does not support effort high" in rendered
+        assert _modal_is_open(app)
+        rows = _modal_rows_text(app)
+        assert "low" in rows
+        assert "medium" in rows
+        assert "high" not in rows
 
 
 @pytest.mark.asyncio
-async def test_app_model_list_shows_available_models():
-    """Bare ``/model`` lists the current provider's available_models()."""
+async def test_app_model_command_opens_model_modal():
+    """``/model`` opens the model picker for the current provider."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = RickshawConfig()
@@ -1302,22 +1332,61 @@ async def test_app_model_list_shows_available_models():
     )
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/model"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "available models" in rendered
-        assert "fake-model" in rendered
-        assert "♦" in rendered
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/model"
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert _modal_is_open(app)
+            assert "Select model" in _modal_title_text(app)
+            assert "fake-model" in _modal_rows_text(app)
 
 
 @pytest.mark.asyncio
-async def test_app_model_rejects_unknown_model():
-    """``/model bad-name`` is rejected with valid options listed."""
+async def test_app_model_modal_selects_model():
+    """Selecting a model in the modal switches the active model."""
+    pytest.importorskip("textual")
+
+    class _TwoModelProvider(_FakeProvider):
+        def available_models(self):
+            return ["fake-model", "fake-model-2"]
+
+    provider = _TwoModelProvider()
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=provider, memory=memory)
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    rebuilt = _TwoModelProvider()
+    rebuilt._model = "fake-model-2"
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider), \
+         patch("rickshaw.tui._rebuild_provider", return_value=rebuilt):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/model"
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert _modal_is_open(app)
+            assert "fake-model-2" in _modal_rows_text(app)
+
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            # effort step for the selected model/provider
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not _modal_is_open(app)
+            assert app.provider is rebuilt
+            assert orch.provider is rebuilt
+            assert app.provider._model == "fake-model-2"
+
+
+@pytest.mark.asyncio
+async def test_app_model_modal_cancel_keeps_current_model():
+    """Cancelling the model modal leaves the current provider/model intact."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = RickshawConfig()
@@ -1327,46 +1396,21 @@ async def test_app_model_rejects_unknown_model():
     )
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/model gpt-4o"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "Unknown model" in rendered
-        assert "fake-model" in rendered
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/model"
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert _modal_is_open(app)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not _modal_is_open(app)
+            assert app.provider is provider
 
 
 @pytest.mark.asyncio
-async def test_app_model_scoped_to_active_provider():
-    """Model selection is scoped: can't pick models from another provider."""
-    pytest.importorskip("textual")
-    orch, provider, _memory = _make_orchestrator()
-    cfg = RickshawConfig()
-    cfg.providers["fake"] = ProviderProfile(
-        base_url="", model="fake-model",
-        api_key_env="FAKE_KEY", wire_format="openai",
-    )
-    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
-
-    async with app.run_test() as pilot:
-        # Try to select a model that doesn't belong to the fake provider.
-        app.query_one("#prompt").value = "/model claude-3-5-sonnet-latest"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "Unknown model" in rendered
-        assert "fake-model" in rendered
-
-
-@pytest.mark.asyncio
-async def test_app_model_switch_effort_reset():
-    """Effort is reset to medium if unsupported by the new model's provider."""
+async def test_app_settings_effort_step_limited_by_provider():
+    """The effort picker is limited to the chosen provider/model's levels."""
     pytest.importorskip("textual")
 
     class _LimitedModelProvider(_FakeProvider):
@@ -1386,7 +1430,7 @@ async def test_app_model_switch_effort_reset():
     provider = _LimitedModelProvider()
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     orch = Orchestrator(provider=provider, memory=memory)
-    orch.effort = Effort.HIGH  # Set an unsupported effort level.
+    orch.effort = Effort.HIGH
     cfg = RickshawConfig()
     cfg.providers["fake"] = ProviderProfile(
         base_url="", model="fake-model",
@@ -1394,25 +1438,40 @@ async def test_app_model_switch_effort_reset():
     )
     app = tui.make_app(orch, provider, Effort.HIGH, cfg=cfg)
 
-    # Patch _rebuild_provider to return a provider with limited effort.
     rebuilt = _LimitedModelProvider()
     rebuilt._model = "fake-model-2"
-    with patch("rickshaw.tui._rebuild_provider", return_value=rebuilt):
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=provider), \
+         patch("rickshaw.tui._rebuild_provider", return_value=rebuilt):
         async with app.run_test() as pilot:
-            app.query_one("#prompt").value = "/model fake-model-2"
+            app.query_one("#prompt").value = "/settings"
             await pilot.press("enter")
             await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "Reset to medium" in rendered
+            # provider step
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            # model step
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            # effort step
+            rows = _modal_rows_text(app)
+            assert "low" in rows
+            assert "medium" in rows
+            assert "high" not in rows
+
+            await pilot.press("down")  # low -> medium
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not _modal_is_open(app)
             assert orch.effort == Effort.MEDIUM
+            assert app.provider is rebuilt
 
 
 @pytest.mark.asyncio
-async def test_app_model_offline_error_surfaces_warning():
-    """If available_models() raises, a warning is shown and no switch happens."""
+async def test_app_model_command_offline_shows_modal_error():
+    """``/model`` surfaces a loader error in the model picker modal."""
     pytest.importorskip("textual")
 
     class _OfflineProvider(_FakeProvider):
@@ -1429,26 +1488,15 @@ async def test_app_model_offline_error_surfaces_warning():
     )
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    async with app.run_test() as pilot:
-        # Bare /model should warn on error.
-        app.query_one("#prompt").value = "/model"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "Cannot list models" in rendered
-
-        # /model <name> should also warn on error and not switch.
-        app.query_one("#prompt").value = "/model some-model"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "Cannot validate model" in rendered
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/model"
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert _modal_is_open(app)
+            rows = _modal_rows_text(app)
+            assert "offline" in rows
+            assert "Retry" in rows
 
 
 @pytest.mark.asyncio
@@ -1487,31 +1535,25 @@ async def test_app_help_lists_provider_command():
 
 
 @pytest.mark.asyncio
-async def test_app_engine_alias_still_works():
-    """``/engine`` still works as a deprecated alias for ``/provider``."""
+async def test_app_engine_alias_opens_provider_modal():
+    """``/engine`` still opens the provider picker modal."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
-    cfg = RickshawConfig()
-    cfg.providers["fake"] = ProviderProfile(
-        base_url="", model="fake-model",
-        api_key_env="FAKE_KEY", wire_format="openai",
-    )
-    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
 
-    async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/engine"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "available providers" in rendered
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/engine"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert _modal_is_open(app)
+            assert "Select provider" in _modal_title_text(app)
 
 
 @pytest.mark.asyncio
 async def test_app_settings_interactive_picker():
-    """``/settings`` starts an interactive wizard: pick provider, then model."""
+    """``/settings`` walks through provider, model, and effort modals."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = RickshawConfig()
@@ -1521,44 +1563,81 @@ async def test_app_settings_interactive_picker():
     )
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    with patch("rickshaw.tui._rebuild_provider", return_value=provider), \
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=provider), \
+         patch("rickshaw.tui._rebuild_provider", return_value=provider):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/settings"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert _modal_is_open(app)
+            assert "Select provider" in _modal_title_text(app)
+            assert "fake" in _modal_rows_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert "Select model" in _modal_title_text(app)
+            assert "fake-model" in _modal_rows_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert "Select effort" in _modal_title_text(app)
+            assert "low" in _modal_rows_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not _modal_is_open(app)
+            assert orch.effort == Effort.MEDIUM
+            assert app.provider is provider
+            assert "fake · fake-model" in _transcript_text(app)
+
+
+@pytest.mark.asyncio
+async def test_settings_provider_modal_does_not_include_unknown_names():
+    """Only built-in providers appear in the provider picker."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["openai"]):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/settings"
+            await pilot.press("enter")
+            await pilot.pause()
+            rows = _modal_rows_text(app)
+            assert "openai" in rows
+            assert "nonexistent" not in rows
+
+
+@pytest.mark.asyncio
+async def test_settings_model_modal_only_lists_available_models():
+    """The model picker only lists models returned by the provider."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
          patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
         async with app.run_test() as pilot:
             app.query_one("#prompt").value = "/settings"
             await pilot.press("enter")
-            await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "Settings" in rendered
-            assert "Pick a provider" in rendered
-
-            # Step 1: pick the "fake" provider.
-            app.query_one("#prompt").value = "fake"
-            await pilot.press("enter")
-            await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "Pick a model" in rendered
-            assert "fake-model" in rendered
-
-            # Step 2: pick the "fake-model" model.
-            app.query_one("#prompt").value = "fake-model"
-            await pilot.press("enter")
-            await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "fake · fake-model" in rendered
+            await pilot.press("enter")  # select provider
+            await pilot.pause(0.2)
+            rows = _modal_rows_text(app)
+            assert "fake-model" in rows
+            assert "bad-model" not in rows
 
 
 @pytest.mark.asyncio
-async def test_app_settings_rejects_unknown_provider():
-    """``/settings`` rejects an unknown provider name."""
+async def test_settings_escape_dismisses_provider_modal():
+    """Escaping the provider step closes the settings modal without applying."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = RickshawConfig()
@@ -1568,80 +1647,18 @@ async def test_app_settings_rejects_unknown_provider():
     )
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/settings"
-        await pilot.press("enter")
-        await pilot.pause()
-
-        app.query_one("#prompt").value = "nonexistent"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "Unknown provider" in rendered
-
-
-@pytest.mark.asyncio
-async def test_app_settings_rejects_unknown_model():
-    """``/settings`` rejects an unknown model in step 2."""
-    pytest.importorskip("textual")
-    orch, provider, _memory = _make_orchestrator()
-    cfg = RickshawConfig()
-    cfg.providers["fake"] = ProviderProfile(
-        base_url="", model="fake-model",
-        api_key_env="FAKE_KEY", wire_format="openai",
-    )
-    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
-
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()):
         async with app.run_test() as pilot:
             app.query_one("#prompt").value = "/settings"
             await pilot.press("enter")
             await pilot.pause()
-
-            # Pick the fake provider.
-            app.query_one("#prompt").value = "fake"
-            await pilot.press("enter")
+            assert _modal_is_open(app)
+            await pilot.press("escape")
             await pilot.pause()
-
-            # Try an invalid model.
-            app.query_one("#prompt").value = "bad-model"
-            await pilot.press("enter")
-            await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "Unknown model" in rendered
-            assert "fake-model" in rendered
-
-
-@pytest.mark.asyncio
-async def test_app_settings_cancel_at_provider_step():
-    """Pressing Esc cancels /settings at the provider step."""
-    pytest.importorskip("textual")
-    orch, provider, _memory = _make_orchestrator()
-    cfg = RickshawConfig()
-    cfg.providers["fake"] = ProviderProfile(
-        base_url="", model="fake-model",
-        api_key_env="FAKE_KEY", wire_format="openai",
-    )
-    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
-
-    async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/settings"
-        await pilot.press("enter")
-        await pilot.pause()
-
-        await pilot.press("escape")
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "(cancelled)" in rendered
+            assert not _modal_is_open(app)
+            assert app.provider is provider
+            assert orch.effort == Effort.MEDIUM
 
 
 @pytest.mark.asyncio
@@ -1700,8 +1717,8 @@ async def test_app_models_offline_error():
 
 
 @pytest.mark.asyncio
-async def test_app_settings_offline_error_aborts():
-    """``/settings`` aborts gracefully if available_models() raises."""
+async def test_settings_offline_error_shown_in_model_modal():
+    """``/settings`` shows a model loader error in the modal instead of aborting."""
     pytest.importorskip("textual")
 
     class _OfflineProvider(_FakeProvider):
@@ -1718,29 +1735,23 @@ async def test_app_settings_offline_error_aborts():
     )
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    # Patch build_provider_from_profile so the /settings wizard also gets an
-    # offline provider (by default it constructs a real OpenAI provider which
-    # may succeed via disk-cached models).
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
         async with app.run_test() as pilot:
             app.query_one("#prompt").value = "/settings"
             await pilot.press("enter")
             await pilot.pause()
-
-            # Pick the fake provider — should fail since models can't be fetched.
-            app.query_one("#prompt").value = "fake"
-            await pilot.press("enter")
-            await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "Cannot list models" in rendered
+            await pilot.press("enter")  # select fake provider
+            await pilot.pause(0.2)
+            assert _modal_is_open(app)
+            rows = _modal_rows_text(app)
+            assert "offline" in rows
 
 
 @pytest.mark.asyncio
-async def test_app_model_error_is_logged(caplog):
-    """Exception details from /model are logged, not just shown in the TUI."""
+async def test_app_models_error_is_logged(caplog):
+    """Exception details from /models are logged, not just shown in the TUI."""
     pytest.importorskip("textual")
 
     class _OfflineProvider(_FakeProvider):
@@ -1751,15 +1762,11 @@ async def test_app_model_error_is_logged(caplog):
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     orch = Orchestrator(provider=provider, memory=memory)
     cfg = RickshawConfig()
-    cfg.providers["fake"] = ProviderProfile(
-        base_url="", model="fake-model",
-        api_key_env="FAKE_KEY", wire_format="openai",
-    )
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
     with caplog.at_level("ERROR"):
         async with app.run_test() as pilot:
-            app.query_one("#prompt").value = "/model"
+            app.query_one("#prompt").value = "/models"
             await pilot.press("enter")
             await pilot.pause()
 
@@ -1768,7 +1775,7 @@ async def test_app_model_error_is_logged(caplog):
 
 @pytest.mark.asyncio
 async def test_app_provider_switch_error_is_logged(caplog):
-    """Exception details from /provider switch are logged."""
+    """Exception details from modal provider switching are logged."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = RickshawConfig()
@@ -1786,11 +1793,26 @@ async def test_app_provider_switch_error_is_logged(caplog):
         raise ValueError("provider construction failed")
 
     with caplog.at_level("ERROR"), \
-         patch("rickshaw.tui.build_provider_from_profile", side_effect=_raise):
+         patch("rickshaw.tui._get_builtin_provider_names", return_value=["broken", "fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=provider), \
+         patch("rickshaw.tui._rebuild_provider", side_effect=_raise):
         async with app.run_test() as pilot:
-            app.query_one("#prompt").value = "/provider broken"
+            app.query_one("#prompt").value = "/settings"
             await pilot.press("enter")
             await pilot.pause()
+            # options sorted: broken, fake; current fake -> up selects broken
+            await pilot.press("up")
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            # model step
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            # effort step
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            assert "Cannot switch" in rendered
 
     assert any("Failed to switch provider" in m for m in caplog.messages)
 
@@ -1799,27 +1821,26 @@ async def test_app_provider_switch_error_is_logged(caplog):
 
 
 @pytest.mark.asyncio
-async def test_app_no_provider_shows_picker():
-    """Launching with provider=None shows the provider picker."""
+async def test_app_no_provider_opens_settings_modal():
+    """Launching with provider=None opens the provider picker modal."""
     pytest.importorskip("textual")
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     orch = Orchestrator(provider=None, memory=memory)
     cfg = RickshawConfig()
     app = tui.make_app(orch, None, Effort.MEDIUM, cfg=cfg)
 
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        rendered = " ".join(
-            str(w.render())
-            for w in app.query_one("#transcript").query("Static")
-        )
-        assert "no provider selected" in rendered
-        assert "Pick a provider" in rendered
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["openai"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()):
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert _modal_is_open(app)
+            assert "Select provider" in _modal_title_text(app)
+            assert "openai" in _modal_rows_text(app)
 
 
 @pytest.mark.asyncio
 async def test_app_picker_selects_key_based_provider():
-    """Selecting a key-based (non-OAuth) provider in the picker works."""
+    """Selecting a key-based (non-OAuth) provider in the modal works."""
     pytest.importorskip("textual")
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     orch = Orchestrator(provider=None, memory=memory)
@@ -1831,64 +1852,58 @@ async def test_app_picker_selects_key_based_provider():
     )
     app = tui.make_app(orch, None, Effort.MEDIUM, cfg=cfg)
 
-    # Patch _builtin_provider_info to return None for "fake" (no OAuth)
-    # and build_provider_from_profile to return our fake provider.
-    with patch("rickshaw.tui._builtin_provider_info", return_value=None), \
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
          patch("rickshaw.tui.build_provider_from_profile", return_value=fake_provider), \
-         patch("rickshaw.tui._get_builtin_provider_names", return_value=[]):
+         patch("rickshaw.tui._rebuild_provider", return_value=fake_provider):
         async with app.run_test() as pilot:
             await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "Pick a provider" in rendered
+            assert _modal_is_open(app)
+            assert "Select provider" in _modal_title_text(app)
+            assert "fake" in _modal_rows_text(app)
 
-            # Select the "fake" provider.
-            app.query_one("#prompt").value = "fake"
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert "Select model" in _modal_title_text(app)
+            assert "fake-model" in _modal_rows_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert "Select effort" in _modal_title_text(app)
+
             await pilot.press("enter")
             await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "Pick a model" in rendered
+            assert not _modal_is_open(app)
+            assert app.provider is fake_provider
 
 
 @pytest.mark.asyncio
 async def test_app_picker_oauth_provider_triggers_login():
-    """Selecting an OAuth provider triggers the login flow (mocked)."""
+    """Selecting an OAuth provider in the modal triggers the login flow (mocked)."""
     pytest.importorskip("textual")
-    from rickshaw_ai.registry import OAuthConfig, ProviderInfo
 
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     orch = Orchestrator(provider=None, memory=memory)
     cfg = RickshawConfig()
     app = tui.make_app(orch, None, Effort.MEDIUM, cfg=cfg)
 
-    # Create a mock OAuth provider info
-    mock_info = MagicMock()
-    mock_info.oauth = MagicMock()
-    mock_info.oauth.mode = "auth_code"
-    mock_info.auth_methods = ["oauth", "api_key"]
-    mock_info.id = "testprov"
+    mock_info = _fake_builtin_info(
+        oauth=MagicMock(mode="auth_code"),
+        env_keys=["TEST_KEY"],
+    )
 
-    with patch("rickshaw.tui._builtin_provider_info", return_value=mock_info), \
-         patch("rickshaw.tui._get_builtin_provider_names", return_value=["testprov"]), \
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["testprov"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=mock_info), \
+         patch.object(type(app), "_provider_has_credential", return_value=False), \
          patch.object(type(app), "_start_oauth_login") as mock_login:
         async with app.run_test() as pilot:
             await pilot.pause()
-            rendered = " ".join(
-                str(w.render())
-                for w in app.query_one("#transcript").query("Static")
-            )
-            assert "Pick a provider" in rendered
+            assert _modal_is_open(app)
+            assert "testprov" in _modal_rows_text(app)
 
-            # Select the OAuth provider.
-            app.query_one("#prompt").value = "testprov"
             await pilot.press("enter")
             await pilot.pause()
-            mock_login.assert_called_once()
+            mock_login.assert_called_once_with("testprov", mock_info)
 
 
 @pytest.mark.asyncio
@@ -2113,59 +2128,80 @@ def test_local_presets_appear_in_config_providers():
 
 
 @pytest.mark.asyncio
-async def test_app_launch_picker_lists_local_presets():
-    """J1: the on-launch picker offers the local presets."""
+async def test_app_launch_picker_lists_built_in_providers_only():
+    """J1: the on-launch provider picker lists built-in providers, not local cfg presets."""
     pytest.importorskip("textual")
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     orch = Orchestrator(provider=None, memory=memory)
     cfg = load_config()
     app = tui.make_app(orch, None, Effort.MEDIUM, cfg=cfg)
 
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        rendered = _transcript_text(app)
-        assert "Pick a provider" in rendered
-        for name in LOCAL_PRESET_NAMES:
-            assert name in rendered
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["openai", "anthropic"]):
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            rows = _modal_rows_text(app)
+            assert "openai" in rows
+            assert "anthropic" in rows
+            for name in LOCAL_PRESET_NAMES:
+                assert name not in rows
 
 
 @pytest.mark.asyncio
-async def test_app_provider_list_includes_local_presets():
-    """``/provider`` lists the local presets alongside hosted ones."""
+async def test_app_provider_command_lists_built_in_providers_only():
+    """``/provider`` opens the modal and lists only built-in providers."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = load_config()
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    async with app.run_test() as pilot:
-        app.query_one("#prompt").value = "/provider"
-        await pilot.press("enter")
-        await pilot.pause()
-        rendered = _transcript_text(app)
-        assert "available providers" in rendered
-        for name in LOCAL_PRESET_NAMES:
-            assert name in rendered
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["openai"]):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/provider"
+            await pilot.press("enter")
+            await pilot.pause()
+            rows = _modal_rows_text(app)
+            assert "openai" in rows
+            for name in LOCAL_PRESET_NAMES:
+                assert name not in rows
 
 
 @pytest.mark.asyncio
-async def test_app_provider_switch_local_auto_selects_single_model():
-    """J1: /provider llamacpp with one served model adopts it silently."""
+async def test_app_provider_switch_local_shows_single_model_picker():
+    """J1: selecting a local provider with one served model still shows the picker."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = load_config()
     local = _LocalProvider(models=["qwen2.5-7b"])
+    applied = _LocalProvider(models=["qwen2.5-7b"])
+    applied._model = "qwen2.5-7b"
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=local):
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["llamacpp"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=local), \
+         patch("rickshaw.tui._rebuild_provider", return_value=applied):
         async with app.run_test() as pilot:
-            app.query_one("#prompt").value = "/provider llamacpp"
+            app.query_one("#prompt").value = "/provider"
             await pilot.press("enter")
             await pilot.pause()
+            assert _modal_is_open(app)
+            assert "Select provider" in _modal_title_text(app)
+            assert "llamacpp" in _modal_rows_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert "Select model" in _modal_title_text(app)
+            assert "qwen2.5-7b" in _modal_rows_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            await pilot.press("enter")  # effort step
+            await pilot.pause()
+            assert not _modal_is_open(app)
             rendered = _transcript_text(app)
-            assert "model · qwen2.5-7b" in rendered
             assert "llamacpp · qwen2.5-7b" in rendered
-            assert app.provider is local
-            assert local._model == "qwen2.5-7b"
+            assert app.provider is applied
+            assert app.provider._model == "qwen2.5-7b"
             assert "llamacpp" in _statusbar_text(app)
 
     s = load_settings()
@@ -2178,8 +2214,8 @@ async def test_app_provider_switch_local_auto_selects_single_model():
 
 
 @pytest.mark.asyncio
-async def test_app_provider_switch_local_multi_model_routes_to_picker():
-    """J3: several installed models route through the /settings model picker."""
+async def test_app_provider_switch_local_multi_model_routes_through_picker():
+    """J3: a local provider with several models routes through the model picker."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = load_config()
@@ -2188,22 +2224,27 @@ async def test_app_provider_switch_local_multi_model_routes_to_picker():
     applied._model = "m-b"
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=local), \
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["ollama"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=local), \
          patch("rickshaw.tui._rebuild_provider", return_value=applied):
         async with app.run_test() as pilot:
-            app.query_one("#prompt").value = "/provider ollama"
+            app.query_one("#prompt").value = "/provider"
             await pilot.press("enter")
             await pilot.pause()
-            rendered = _transcript_text(app)
-            assert "Pick a model" in rendered
-            assert "m-a" in rendered
-            assert "m-b" in rendered
-            # Not switched yet: the picker applies the choice.
-            assert app.provider is provider
+            await pilot.press("enter")  # ollama
+            await pilot.pause(0.2)
+            assert "Select model" in _modal_title_text(app)
+            rows = _modal_rows_text(app)
+            assert "m-a" in rows
+            assert "m-b" in rows
 
-            app.query_one("#prompt").value = "m-b"
+            await pilot.press("down")
             await pilot.press("enter")
+            await pilot.pause(0.2)
+            await pilot.press("enter")  # effort
             await pilot.pause()
+            assert not _modal_is_open(app)
             rendered = _transcript_text(app)
             assert "ollama · m-b" in rendered
             assert app.provider is applied
@@ -2214,8 +2255,8 @@ async def test_app_provider_switch_local_multi_model_routes_to_picker():
 
 
 @pytest.mark.asyncio
-async def test_app_provider_switch_local_missing_model_falls_back():
-    """J9: a persisted model that vanished is re-resolved (note + auto-select)."""
+async def test_app_provider_switch_local_missing_model_shows_picker():
+    """J9: a persisted local model that vanished is replaced via the model picker."""
     pytest.importorskip("textual")
     s = load_settings()
     s.setdefault("providers", {})["llamacpp"] = {
@@ -2228,42 +2269,59 @@ async def test_app_provider_switch_local_missing_model_falls_back():
     cfg = load_config()
     assert cfg.providers["llamacpp"].model == "old.gguf"
     local = _LocalProvider(models=["new.gguf"])
+    applied = _LocalProvider(models=["new.gguf"])
+    applied._model = "new.gguf"
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=local):
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["llamacpp"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=local), \
+         patch("rickshaw.tui._rebuild_provider", return_value=applied):
         async with app.run_test() as pilot:
-            app.query_one("#prompt").value = "/provider llamacpp"
+            app.query_one("#prompt").value = "/provider"
             await pilot.press("enter")
             await pilot.pause()
+            await pilot.press("enter")  # llamacpp
+            await pilot.pause(0.2)
+            rows = _modal_rows_text(app)
+            assert "new.gguf" in rows
+
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            await pilot.press("enter")  # effort
+            await pilot.pause()
+            assert not _modal_is_open(app)
             rendered = _transcript_text(app)
-            assert "'old.gguf' is no longer available" in rendered
-            assert "model · new.gguf" in rendered
-            assert app.provider is local
+            assert "llamacpp · new.gguf" in rendered
+            assert app.provider is applied
 
     entry = load_settings()["providers"]["llamacpp"]
     assert entry["model"] == "new.gguf"
-    # Pre-existing keys of the entry are preserved.
     assert entry["timeout"] == 300
     assert entry["base_url"] == "http://localhost:8080/v1"
 
 
 @pytest.mark.asyncio
 async def test_app_provider_switch_local_server_down_keeps_previous():
-    """J5: a down server fails the switch with a hint; previous provider stays."""
+    """J5: a down server shows an error in the model picker; previous provider stays."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = load_config()
     down = _DownLocalProvider()
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=down):
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["llamacpp"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=down):
         async with app.run_test() as pilot:
-            app.query_one("#prompt").value = "/provider llamacpp"
+            app.query_one("#prompt").value = "/provider"
             await pilot.press("enter")
             await pilot.pause()
-            rendered = _transcript_text(app)
-            assert "Cannot switch provider" in rendered
-            assert local_server_down_hint("llamacpp") in rendered
+            await pilot.press("enter")  # llamacpp
+            await pilot.pause(0.2)
+            assert _modal_is_open(app)
+            rows = _modal_rows_text(app)
+            assert "connection refused" in rows
             assert app.provider is provider
             assert orch.provider is provider
 
@@ -2272,21 +2330,29 @@ async def test_app_provider_switch_local_server_down_keeps_previous():
 
 @pytest.mark.asyncio
 async def test_app_local_effort_note_shown_once():
-    """J4: entering a local provider notes effort once; effort is untouched."""
+    """J4: selecting a local provider notes effort once; effort is untouched."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     orch.effort = Effort.HIGH
     cfg = load_config()
     local = _LocalProvider(models=["m1"], base_url="http://localhost:1234/v1")
+    applied = _LocalProvider(models=["m1"], base_url="http://localhost:1234/v1")
+    applied._model = "m1"
     app = tui.make_app(orch, provider, Effort.HIGH, cfg=cfg)
 
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=local):
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["lmstudio"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=local), \
+         patch("rickshaw.tui._rebuild_provider", return_value=applied):
         async with app.run_test() as pilot:
-            app.query_one("#prompt").value = "/provider lmstudio"
+            app.query_one("#prompt").value = "/provider"
             await pilot.press("enter")
             await pilot.pause()
-            app.query_one("#prompt").value = "/provider lmstudio"
-            await pilot.press("enter")
+            await pilot.press("enter")  # lmstudio
+            await pilot.pause(0.2)
+            await pilot.press("enter")  # model
+            await pilot.pause(0.2)
+            await pilot.press("enter")  # effort
             await pilot.pause()
             rendered = _transcript_text(app)
             note = (
@@ -2297,10 +2363,23 @@ async def test_app_local_effort_note_shown_once():
             assert orch.effort == Effort.HIGH
             assert "Reset to medium" not in rendered
 
+            # second time
+            app.query_one("#prompt").value = "/provider"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = _transcript_text(app)
+            assert rendered.count(note) == 1
+
 
 @pytest.mark.asyncio
-async def test_app_hosted_effort_reset_warning_unchanged():
-    """Hosted providers keep the effort-reset warning on every switch."""
+async def test_app_hosted_effort_step_constrained_to_supported_levels():
+    """Hosted providers with limited effort levels show only supported options."""
     pytest.importorskip("textual")
 
     class _NoHighProvider(_FakeProvider):
@@ -2322,26 +2401,34 @@ async def test_app_hosted_effort_reset_warning_unchanged():
     hosted = _NoHighProvider()
     app = tui.make_app(orch, provider, Effort.HIGH, cfg=cfg)
 
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=hosted):
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["hosted"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=hosted), \
+         patch("rickshaw.tui._rebuild_provider", return_value=hosted):
         async with app.run_test() as pilot:
-            app.query_one("#prompt").value = "/provider hosted"
+            app.query_one("#prompt").value = "/settings"
             await pilot.press("enter")
             await pilot.pause()
+            await pilot.press("enter")  # hosted
+            await pilot.pause(0.2)
+            await pilot.press("enter")  # model
+            await pilot.pause(0.2)
+            rows = _modal_rows_text(app)
+            assert "low" in rows
+            assert "medium" in rows
+            assert "high" not in rows
+
+            await pilot.press("down")  # low -> medium
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not _modal_is_open(app)
             assert orch.effort == Effort.MEDIUM
-            orch.effort = Effort.HIGH
-            app.query_one("#prompt").value = "/provider hosted"
-            await pilot.press("enter")
-            await pilot.pause()
-            rendered = _transcript_text(app)
-            assert rendered.count(
-                "note: hosted does not support effort high. Reset to medium."
-            ) == 2
-            assert "effort is not applicable" not in rendered
+            assert app.provider is hosted
 
 
 @pytest.mark.asyncio
-async def test_app_settings_flow_local_auto_selects_single_model():
-    """J1: the on-launch picker auto-selects a lone local model and persists."""
+async def test_app_settings_flow_local_shows_single_model_picker():
+    """J1: the /settings flow still shows the model picker for a lone local model."""
     pytest.importorskip("textual")
     memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
     orch = Orchestrator(provider=None, memory=memory)
@@ -2351,21 +2438,28 @@ async def test_app_settings_flow_local_auto_selects_single_model():
     applied._model = "solo-model"
     app = tui.make_app(orch, None, Effort.MEDIUM, cfg=cfg)
 
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=local), \
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["llamacpp"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=local), \
          patch("rickshaw.tui._rebuild_provider", return_value=applied):
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert "Pick a provider" in _transcript_text(app)
+            assert _modal_is_open(app)
+            assert "Select provider" in _modal_title_text(app)
 
-            app.query_one("#prompt").value = "llamacpp"
             await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert "Select model" in _modal_title_text(app)
+            assert "solo-model" in _modal_rows_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            await pilot.press("enter")  # effort
             await pilot.pause()
+            assert not _modal_is_open(app)
             rendered = _transcript_text(app)
-            assert "Pick a model" not in rendered
-            assert "model: solo-model" in rendered
             assert "llamacpp · solo-model" in rendered
             assert app.provider is applied
-            assert app._settings_state is None
             assert "llamacpp" in _statusbar_text(app)
 
     s = load_settings()
@@ -2375,26 +2469,25 @@ async def test_app_settings_flow_local_auto_selects_single_model():
 
 @pytest.mark.asyncio
 async def test_app_settings_flow_local_no_models_shows_hint():
-    """An empty local model list aborts the picker with the per-server hint."""
+    """An empty local model list shows the empty message in the model picker."""
     pytest.importorskip("textual")
     orch, provider, _memory = _make_orchestrator()
     cfg = load_config()
     local = _LocalProvider(models=[])
     app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
 
-    with patch("rickshaw.tui.build_provider_from_profile", return_value=local):
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["llamacpp"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=local):
         async with app.run_test() as pilot:
             app.query_one("#prompt").value = "/settings"
             await pilot.press("enter")
             await pilot.pause()
-
-            app.query_one("#prompt").value = "llamacpp"
-            await pilot.press("enter")
-            await pilot.pause()
-            rendered = _transcript_text(app)
-            assert "No models available for llamacpp" in rendered
-            assert local_no_models_hint("llamacpp") in rendered
-            assert app._settings_state is None
+            await pilot.press("enter")  # llamacpp
+            await pilot.pause(0.2)
+            assert _modal_is_open(app)
+            rows = _modal_rows_text(app)
+            assert "No models available for llamacpp" in rows
             assert app.provider is provider
 
 
@@ -3170,3 +3263,260 @@ async def test_ctrl_l_redraws_without_clearing():
         transcript_after = list(app.query_one("#transcript").children)
         assert len(transcript_after) == len(transcript_before)
         assert "hi" in _transcript_text(app)
+
+
+# --- SelectionModal focused tests -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_selection_modal_navigation():
+    """Up/down wrap and Enter selects the highlighted option."""
+    pytest.importorskip("textual")
+    from rickshaw.selection_modal import SelectionModal, SelectionStep
+
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+    selected = None
+
+    def cb(result):
+        nonlocal selected
+        selected = result
+
+    async with app.run_test() as pilot:
+        app.push_screen(
+            SelectionModal(
+                SelectionStep(
+                    "p",
+                    "Pick",
+                    options=[("a", "A"), ("b", "B"), ("c", "C")],
+                ),
+                on_advance=None,
+            ),
+            cb,
+        )
+        await pilot.pause()
+        assert _modal_title_text(app) == "Pick"
+
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert selected == {"p": "b"}
+
+        selected = None
+        app.push_screen(
+            SelectionModal(
+                SelectionStep(
+                    "p",
+                    "Pick",
+                    options=[("a", "A"), ("b", "B"), ("c", "C")],
+                ),
+                on_advance=None,
+            ),
+            cb,
+        )
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert selected == {"p": "a"}
+
+        selected = None
+        app.push_screen(
+            SelectionModal(
+                SelectionStep(
+                    "p",
+                    "Pick",
+                    options=[("a", "A"), ("b", "B"), ("c", "C")],
+                ),
+                on_advance=None,
+            ),
+            cb,
+        )
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert selected == {"p": "c"}
+
+
+@pytest.mark.asyncio
+async def test_selection_modal_async_loader():
+    """A step loader populates options asynchronously and shows a loading state."""
+    pytest.importorskip("textual")
+    import threading
+    from rickshaw.selection_modal import SelectionModal, SelectionStep
+
+    ready = threading.Event()
+
+    def loader():
+        ready.wait(5)
+        return [("x", "X"), ("y", "Y")]
+
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.push_screen(
+            SelectionModal(
+                SelectionStep("p", "Pick", loader=loader),
+                on_advance=None,
+            )
+        )
+        await pilot.pause()
+        assert "Loading" in _modal_rows_text(app)
+
+        ready.set()
+        await pilot.pause(0.2)
+        rows = _modal_rows_text(app)
+        assert "X" in rows
+        assert "Y" in rows
+
+
+@pytest.mark.asyncio
+async def test_settings_flow_provider_to_model_to_effort():
+    """``/settings`` flows provider -> model -> effort and applies all three."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["fake"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=provider), \
+         patch("rickshaw.tui._rebuild_provider", return_value=provider):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/settings"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert "Select provider" in _modal_title_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert "Select model" in _modal_title_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert "Select effort" in _modal_title_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not _modal_is_open(app)
+            assert orch.effort == Effort.MEDIUM
+            assert app.provider is provider
+            assert "fake · fake-model" in _transcript_text(app)
+
+
+@pytest.mark.asyncio
+async def test_provider_command_opens_modal():
+    """``/provider`` opens the built-in provider picker modal."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["openai"]):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/provider"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert _modal_is_open(app)
+            assert "Select provider" in _modal_title_text(app)
+            assert "openai" in _modal_rows_text(app)
+
+
+@pytest.mark.asyncio
+async def test_model_command_opens_modal():
+    """``/model`` opens the model picker for the current provider."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = RickshawConfig()
+    cfg.providers["fake"] = ProviderProfile(
+        base_url="", model="fake-model",
+        api_key_env="FAKE_KEY", wire_format="openai",
+    )
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui.build_provider_from_profile", return_value=provider):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/model"
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert _modal_is_open(app)
+            assert "Select model" in _modal_title_text(app)
+            assert "fake-model" in _modal_rows_text(app)
+
+
+@pytest.mark.asyncio
+async def test_effort_command_opens_modal():
+    """``/effort`` opens the effort picker modal."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    app = tui.make_app(orch, provider, Effort.MEDIUM)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt").value = "/effort"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert _modal_is_open(app)
+        assert "Select effort" in _modal_title_text(app)
+        assert "low" in _modal_rows_text(app)
+
+
+@pytest.mark.asyncio
+async def test_oauth_provider_triggers_login_from_modal():
+    """Selecting an OAuth provider in the modal triggers the login flow (mocked)."""
+    pytest.importorskip("textual")
+
+    memory = MemoryService(embedder=TFIDFEmbedder(dim=32))
+    orch = Orchestrator(provider=None, memory=memory)
+    cfg = RickshawConfig()
+    app = tui.make_app(orch, None, Effort.MEDIUM, cfg=cfg)
+
+    mock_info = _fake_builtin_info(
+        oauth=MagicMock(mode="auth_code"),
+        env_keys=["TEST_KEY"],
+    )
+
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["testprov"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=mock_info), \
+         patch.object(type(app), "_provider_has_credential", return_value=False), \
+         patch.object(type(app), "_start_oauth_login") as mock_login:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert _modal_is_open(app)
+            assert "testprov" in _modal_rows_text(app)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            mock_login.assert_called_once_with("testprov", mock_info)
+
+
+@pytest.mark.asyncio
+async def test_local_provider_shows_single_model_picker():
+    """Local providers always show the model picker, even with a single model."""
+    pytest.importorskip("textual")
+    orch, provider, _memory = _make_orchestrator()
+    cfg = load_config()
+    local = _LocalProvider(models=["only-model"])
+    applied = _LocalProvider(models=["only-model"])
+    applied._model = "only-model"
+    app = tui.make_app(orch, provider, Effort.MEDIUM, cfg=cfg)
+
+    with patch("rickshaw.tui._get_builtin_provider_names", return_value=["llamacpp"]), \
+         patch("rickshaw.tui._builtin_provider_info", return_value=_fake_builtin_info()), \
+         patch("rickshaw.tui.build_provider_from_profile", return_value=local), \
+         patch("rickshaw.tui._rebuild_provider", return_value=applied):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt").value = "/settings"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")  # llamacpp
+            await pilot.pause(0.2)
+            assert _modal_is_open(app)
+            assert "Select model" in _modal_title_text(app)
+            assert "only-model" in _modal_rows_text(app)
+            assert _modal_rows_text(app).count("only-model") == 1
