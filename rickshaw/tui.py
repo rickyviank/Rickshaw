@@ -91,6 +91,7 @@ _COMMANDS = {
     "/settings": "Interactive provider/model picker (also shows current settings).",
     "/models": "List the current provider's available models.",
     "/clear": "Clear the transcript.",
+    "/keybindings": "Show the keybinding reference.",
     "/provider": "/provider [name|add] -- show, switch, or register a provider.",
     "/effort": "/effort <low|medium|high> -- set reasoning effort.",
     "/model": "/model [name] -- show or switch the chat model.",
@@ -115,8 +116,11 @@ STATUS_BAR_KEEP_ALWAYS = {"provider", "model", "effort"}
 STATUS_BAR_DROP_ORDER = ("price", "tokens", "context")
 STATUS_BAR_NARROW_WIDTH = 80
 
-_DEFAULT_HINT = "/help  ·  ^o expand trace  ·  tab focus trace  ·  ctrl+up/down navigate  ·  esc interrupt  ·  ^c quit"
-_TRACE_HINT = "up/down navigate  ·  enter expand/collapse  ·  r raw  ·  esc return to prompt"
+_DEFAULT_HINT = "enter submit · tab newest turn · shift+tab oldest turn · / menu · esc interrupt · ctrl+c quit"
+_TURN_HINT = "tab next/prev turn · enter expand trace · esc prompt"
+_TRACE_HINT = "tab next/prev event · enter toggle · esc collapse trace · r raw"
+_MENU_HINT = "tab cycle · enter accept · esc close"
+_OVERLAY_HINT = "esc/q close"
 
 # Map formatter color class names to Textual markup styles.
 _TRACE_STYLE_MAP = {
@@ -462,20 +466,28 @@ def make_app(
             app = self.app
             if event.key == "tab":
                 if app._menu_open and app._menu_items:
-                    if app._menu_accept(via_enter=False):
-                        event.prevent_default()
-                        event.stop()
-                        return
-                if (
+                    app._menu_cycle(1)
+                elif (
                     app._login_state is None
                     and app._settings_state is None
                     and app._provider_add_state is None
-                    and app._turns
                 ):
-                    app.focus_trace()
-                    event.prevent_default()
-                    event.stop()
-                    return
+                    app._focus_ring_step()
+                event.prevent_default()
+                event.stop()
+                return
+            if event.key == "shift+tab":
+                if app._menu_open and app._menu_items:
+                    app._menu_cycle(-1)
+                elif (
+                    app._login_state is None
+                    and app._settings_state is None
+                    and app._provider_add_state is None
+                ):
+                    app._focus_ring_step(reverse=True)
+                event.prevent_default()
+                event.stop()
+                return
             if event.key == "enter":
                 event.prevent_default()
                 event.stop()
@@ -486,6 +498,10 @@ def make_app(
                 event.stop()
                 self.insert("\n")
                 return
+
+        def on_focus(self, event) -> None:
+            if hasattr(self.app, "_update_hint"):
+                self.app._update_hint()
 
     class TraceLineWidget(Vertical):
         """A single focusable line inside an expanded trace block."""
@@ -591,6 +607,14 @@ def make_app(
                 self._content_widget = None
             self._refresh()
 
+        def on_focus(self, event) -> None:
+            if hasattr(self.trace_block, "_on_line_focus_changed"):
+                self.trace_block._on_line_focus_changed()
+
+        def on_blur(self, event) -> None:
+            if hasattr(self.trace_block, "_on_line_focus_changed"):
+                self.trace_block._on_line_focus_changed()
+
         def on_key(self, event) -> None:
             if event.key == "up":
                 self.trace_block.focus_line(self.index - 1)
@@ -598,6 +622,14 @@ def make_app(
                 event.prevent_default()
             elif event.key == "down":
                 self.trace_block.focus_line(self.index + 1)
+                event.stop()
+                event.prevent_default()
+            elif event.key == "tab":
+                self.app._focus_ring_step()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "shift+tab":
+                self.app._focus_ring_step(reverse=True)
                 event.stop()
                 event.prevent_default()
             elif event.key == "enter":
@@ -609,20 +641,15 @@ def make_app(
                 event.stop()
                 event.prevent_default()
             elif event.key == "escape":
-                self.trace_block.focus_prompt()
+                self.trace_block.collapse()
+                self.trace_block.focus()
                 event.stop()
                 event.prevent_default()
 
-        def on_focus(self, event) -> None:
-            if hasattr(self.trace_block, "_on_line_focus_changed"):
-                self.trace_block._on_line_focus_changed()
-
-        def on_blur(self, event) -> None:
-            if hasattr(self.trace_block, "_on_line_focus_changed"):
-                self.trace_block._on_line_focus_changed()
-
     class TraceBlock(Vertical):
         """Collapsible per-turn trace summary/details block."""
+
+        can_focus = True
 
         def __init__(
             self,
@@ -706,14 +733,12 @@ def make_app(
                 self.details.display = True
                 self.add_class("expanded")
             else:
-                focused = self.app.focused
-                if isinstance(focused, TraceLineWidget) and focused.trace_block is self:
-                    self.focus_prompt()
                 self.details.display = False
                 self.remove_class("expanded")
+            self.can_focus = not self._expanded
             self.summary.update(escape(self._summary_text()))
-            if hasattr(self.app, "_update_trace_hint"):
-                self.app._update_trace_hint()
+            if hasattr(self.app, "_update_hint"):
+                self.app._update_hint()
 
         def expand(self) -> None:
             if not self._expanded:
@@ -749,8 +774,34 @@ def make_app(
                 widget.set_raw_mode(self._raw_mode)
 
         def _on_line_focus_changed(self) -> None:
-            if hasattr(self.app, "_update_trace_hint"):
-                self.app._update_trace_hint()
+            if hasattr(self.app, "_update_hint"):
+                self.app._update_hint()
+
+        def on_focus(self, event) -> None:
+            if hasattr(self.app, "_update_hint"):
+                self.app._update_hint()
+
+        def on_key(self, event) -> None:
+            if event.key == "enter":
+                self.expand()
+                if self._line_widgets:
+                    self.focus_first_line()
+                else:
+                    self.can_focus = True
+                event.stop()
+                event.prevent_default()
+            elif event.key == "tab":
+                self.app._focus_ring_step()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "shift+tab":
+                self.app._focus_ring_step(reverse=True)
+                event.stop()
+                event.prevent_default()
+            elif event.key == "escape":
+                self.focus_prompt()
+                event.stop()
+                event.prevent_default()
 
     class RickshawTUI(App):
         """Textual application driving turns through the Orchestrator."""
@@ -875,7 +926,8 @@ def make_app(
           .u.selected {
               background: #2a2f36;
           }
-          .trace-block.selected {
+          .trace-block.selected,
+          .trace-block:focus {
               border: tall $rk-accent;
           }
           .trace-line { height: auto; color: $rk-text; }
@@ -899,11 +951,8 @@ def make_app(
 
         BINDINGS = [
             Binding("escape", "interrupt", "Interrupt", show=False),
-            Binding("ctrl+l", "clear", "Clear", show=False),
+            Binding("ctrl+l", "redraw", "Redraw", show=False),
             Binding("ctrl+c", "ctrl_c", "Quit", show=False, priority=True),
-            Binding("ctrl+up", "prev_turn", "Prev turn", show=False),
-            Binding("ctrl+down", "next_turn", "Next turn", show=False),
-            Binding("ctrl+o", "toggle_trace", "Toggle trace", show=False),
             Binding("r", "toggle_trace_raw", "Toggle raw trace", show=False),
         ]
 
@@ -939,7 +988,6 @@ def make_app(
             self._current_turn_id: str | None = None
             self._current_user: Static | None = None
             self._turns: list[dict] = []
-            self._selected_turn_index = -1
             self._ctrl_c_pending = False
             self._ctrl_c_timer = None
             self._session_tokens = 0
@@ -1227,6 +1275,7 @@ def make_app(
                 self._menu_index = 0
             self.query_one("#slashmenu", Static).display = True
             self._render_menu()
+            self._update_hint()
 
         def _close_menu(self) -> None:
             self._menu_open = False
@@ -1237,6 +1286,13 @@ def make_app(
             menu = self.query_one("#slashmenu", Static)
             menu.update("")
             menu.display = False
+            self._update_hint()
+
+        def _menu_cycle(self, direction: int) -> None:
+            if not self._menu_open or not self._menu_items:
+                return
+            self._menu_index = (self._menu_index + direction) % len(self._menu_items)
+            self._render_menu()
 
         def _menu_accept(self, *, via_enter: bool) -> bool:
             if not self._menu_open or not self._menu_items:
@@ -1386,9 +1442,13 @@ def make_app(
                     event.stop()
                     event.prevent_default()
                 elif event.key == "tab":
-                    if self._menu_accept(via_enter=False):
-                        event.stop()
-                        event.prevent_default()
+                    self._menu_cycle(1)
+                    event.stop()
+                    event.prevent_default()
+                elif event.key == "shift+tab":
+                    self._menu_cycle(-1)
+                    event.stop()
+                    event.prevent_default()
                 elif event.key == "escape":
                     self._close_menu()
                     event.stop()
@@ -1473,6 +1533,8 @@ def make_app(
                 self._cmd_status()
             elif cmd == "/clear":
                 self.action_clear()
+            elif cmd == "/keybindings":
+                self._cmd_keybindings()
             elif cmd == "/effort":
                 self._cmd_effort(arg)
             elif cmd == "/model":
@@ -1494,6 +1556,15 @@ def make_app(
             for name, desc in _COMMANDS.items():
                 self._write(f"{name}  {desc}", "meta")
             self._write("esc interrupts a running turn · ^c quits", "meta")
+
+        def _cmd_keybindings(self) -> None:
+            from rickshaw.keybindings_modal import KeybindingsModal
+
+            def _on_close(_value: None) -> None:
+                self._update_hint()
+
+            self.push_screen(KeybindingsModal(), _on_close)
+            self._set_hint(_OVERLAY_HINT)
 
         def _cmd_status(self) -> None:
             if self.provider is None:
@@ -2633,89 +2704,75 @@ def make_app(
             self.query_one("#transcript", VerticalScroll).remove_children()
             self._has_turns = False
             self._turns = []
-            self._selected_turn_index = -1
             self.call_after_refresh(self._finish_clear)
 
         def _finish_clear(self) -> None:
             self._render_welcome()
             self._write("cleared.", "meta")
 
-        def _set_selected_turn(self, index: int) -> None:
-            old = self._selected_turn_index
-            if old >= 0 and old < len(self._turns):
-                self._turns[old]["user"].remove_class("selected")
-                self._turns[old]["trace"].remove_class("selected")
-            self._selected_turn_index = index
-            if index >= 0 and index < len(self._turns):
-                self._turns[index]["user"].add_class("selected")
-                self._turns[index]["trace"].add_class("selected")
-                self._turns[index]["trace"].scroll_visible()
-
-        def action_prev_turn(self) -> None:
-            if not self._turns:
-                return
-            if self._selected_turn_index == -1:
-                new = len(self._turns) - 1
-            else:
-                new = max(0, self._selected_turn_index - 1)
-            self._set_selected_turn(new)
-
-        def action_next_turn(self) -> None:
-            if not self._turns:
-                return
-            if self._selected_turn_index == -1:
-                return
-            new = self._selected_turn_index + 1
-            if new >= len(self._turns):
-                self._set_selected_turn(-1)
-                self.query_one("#prompt", PromptArea).focus()
-            else:
-                self._set_selected_turn(new)
-
-        def action_toggle_trace(self) -> None:
-            if not self._turns:
-                return
-            focused = self.focused
-            if isinstance(focused, TraceLineWidget):
-                trace = focused.trace_block
-                for index, turn in enumerate(self._turns):
-                    if turn["trace"] is trace:
-                        self._set_selected_turn(index)
-                        break
-            else:
-                if self._selected_turn_index == -1:
-                    self._set_selected_turn(len(self._turns) - 1)
-                trace = self._turns[self._selected_turn_index]["trace"]
-            trace.toggle()
-
         def action_toggle_trace_raw(self) -> None:
             focused = self.focused
             if isinstance(focused, TraceLineWidget):
                 focused.trace_block.toggle_raw_mode()
 
-        def focus_trace(self) -> None:
-            if not self._turns:
+        def action_redraw(self) -> None:
+            self.screen.refresh()
+            try:
+                self.query_one("#transcript", VerticalScroll).refresh()
+            except Exception:
+                pass
+
+        def _focus_ring_candidates(self) -> list:
+            prompt = self.query_one("#prompt", PromptArea)
+            candidates = [prompt]
+            for turn in reversed(self._turns):
+                trace = turn["trace"]
+                if trace._expanded and trace._line_widgets:
+                    candidates.extend(trace._line_widgets)
+                else:
+                    candidates.append(trace)
+            return candidates
+
+        def _focus_ring_step(self, reverse: bool = False) -> None:
+            if self._turn_active or not self._turns:
                 return
-            if self._selected_turn_index == -1:
-                self._set_selected_turn(len(self._turns) - 1)
-            trace = self._turns[self._selected_turn_index]["trace"]
-            if not trace._expanded:
-                trace.expand()
-            self.call_after_refresh(self._finish_focus_trace, trace)
-
-        def _finish_focus_trace(self, trace: "TraceBlock") -> None:
-            trace.focus_first_line()
-            self._update_trace_hint()
-
-        def _update_trace_hint(self) -> None:
+            candidates = self._focus_ring_candidates()
+            if not candidates:
+                return
             focused = self.focused
+            try:
+                idx = candidates.index(focused)
+            except ValueError:
+                idx = 0
+            if reverse:
+                new_idx = (idx - 1) % len(candidates)
+            else:
+                new_idx = (idx + 1) % len(candidates)
+            target = candidates[new_idx]
+            target.focus(scroll_visible=False)
+            target.scroll_visible(animate=False, immediate=True)
+            self.call_after_refresh(self._update_hint)
+
+        def _update_hint(self) -> None:
+            if self._menu_open:
+                self._set_hint(_MENU_HINT)
+                return
             if (
-                isinstance(focused, TraceLineWidget)
-                and focused.trace_block._expanded
+                self._login_state is not None
+                or self._settings_state is not None
+                or self._provider_add_state is not None
             ):
+                return
+            focused = self.focused
+            if isinstance(focused, TraceLineWidget) and focused.trace_block._expanded:
                 self._set_hint(_TRACE_HINT)
+            elif isinstance(focused, TraceBlock):
+                self._set_hint(_TURN_HINT)
             else:
                 self._set_hint(_DEFAULT_HINT)
+
+        def on_focus(self, event) -> None:
+            self._update_hint()
 
     return RickshawTUI(trace_store=trace_store)
 
