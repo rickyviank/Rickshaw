@@ -129,11 +129,12 @@ rickshaw --provider openai --allow-unvalidated
 ```
 
 When launched without `--provider` and with no persisted provider in
-`~/.rickshaw/settings.json`, the TUI opens in a *no-provider-selected* state and
-immediately shows an interactive provider picker listing all built-in providers
+`~/.rickshaw/settings.json`, the TUI opens a multi-step picker to choose
+provider, model, and effort. The provider step lists all built-in providers
 (from `rickshaw_ai`). Selecting an OAuth-capable provider (e.g. `anthropic`,
-`openai`, `copilot`) triggers an in-TUI OAuth login flow. `--provider` remains
-available as an optional override for backward compatibility.
+`openai`, `copilot`) triggers an in-TUI OAuth login flow before continuing to
+model selection. `--provider` remains available as an optional override for
+backward compatibility.
 
 ### Terminal UI
 
@@ -153,13 +154,15 @@ surfaced.
   follow-up — the provider's `stream()` doesn't yet parse tool calls.)
 - **Memory** persists to a local SQLite file (`--db-path`, default
   `rickshaw_memory.db`) so context carries across sessions.
-- **Slash-commands:** `/help`, `/status` (provider · model · effort), `/settings`
-  (show current settings), `/provider [name|add]` (list, switch, or register a
-  provider), `/login` (authenticate the active provider via OAuth), `/clear`
-  (clear the transcript), `/effort <level>`, `/model [name]`, `/memory`,
-  `/keybindings` (open keybinding overlay), `/quit`.
-  `/engine` is still accepted as a deprecated alias for `/provider`.
-  Type `/` for inline autocomplete.
+- **Slash-commands:** `/help`, `/status` (provider · model · effort),
+  `/settings` (interactive provider/model/effort picker), `/provider` (open the
+  provider picker), `/provider add` (register a custom OpenAI-compatible
+  endpoint), `/model` (open the model picker for the current provider), `/effort`
+  (open the effort picker for the current provider/model), `/login` (authenticate
+  the active provider via OAuth), `/models` (list current provider's models),
+  `/memory`, `/clear` (clear the transcript), `/keybindings` (open keybinding
+  overlay), `/quit`. `/engine` is still accepted as a deprecated alias for
+  `/provider`. Type `/` for inline autocomplete.
 - **Keys:** `Esc` interrupts an in-flight turn, closes the slash menu, clears the
   prompt, or exits a focused trace; `Ctrl+L` redraws the screen; `Ctrl+C` quits.
 
@@ -211,36 +214,25 @@ answer/thinking blocks).
   `traces` and `trace_events` tables. They survive `/clear` and can be queried
   outside the TUI.
 
-### `/settings` — interactive provider/model picker
+### `/settings` — interactive provider/model/effort picker
 
-`/settings` shows current settings then launches an interactive two-step wizard:
+`/settings` opens a centered modal picker with up to three steps:
 
-1. **Pick a provider** — lists all built-in providers (from `rickshaw_ai`) and
-   any custom providers from `~/.rickshaw/settings.json`, with the active one
-   marked. OAuth-capable providers are tagged with `(oauth)`.
-2. **OAuth login** — if the chosen provider supports OAuth, a login flow is
-   triggered (browser-based PKCE or device-code). Credentials are persisted to
-   `~/.rickshaw/credentials.json`.
-3. **Pick a model** — for non-OAuth providers, lists the chosen provider's
-   `available_models()` with the active model marked; selecting one applies the
-   switch immediately.
+1. **Pick a provider** — lists all built-in providers (from `rickshaw_ai`), with
+   the active one highlighted. OAuth-capable providers are tagged with `(oauth)`.
+   Custom providers registered via `/provider add` are not shown here; set them
+   in `~/.rickshaw/settings.json` and relaunch.
+2. **OAuth login** — if the chosen provider supports OAuth and no credential is
+   present, an in-TUI login flow is triggered (browser-based PKCE or device-code).
+   Credentials are persisted to `~/.rickshaw/credentials.json`.
+3. **Pick a model** — lists the chosen provider's `available_models()` with the
+   active model highlighted. Local providers always show this step, even when
+   only one model is available.
+4. **Pick effort** — shows only the effort levels the chosen provider/model
+   supports. If just one level is available it is shown with a note.
 
-```
-Settings
-────────────────────────────────────────────
-  provider         openai
-  model            gpt-4o
-  effort           medium
-  embedding        openai / text-embedding-3-small
-────────────────────────────────────────────
-
-  Pick a provider (enter name, Esc to cancel):
-    anthropic
-    devin
-    openai           ♦
-```
-
-Press `Esc` at any step to cancel.
+Use `Up`/`Down`/`Tab`/`Shift+Tab` to move the highlight, `Enter` to select, and
+`Esc` to go back one step or cancel the picker.
 
 If the chosen provider does not support the current effort level, effort is
 automatically reset to `medium` and a warning is shown.
@@ -252,10 +244,22 @@ with the active one marked — a quick discoverability shortcut.
 
 ### `/provider` command
 
-Use `/provider` to list available providers, `/provider <name>` to switch, or
-`/provider add` to register a custom OpenAI-compatible endpoint step by step.
-The deprecated `/engine` alias still works for backward compatibility.
+Use `/provider` to open the interactive provider picker, or `/provider add` to
+register a custom OpenAI-compatible endpoint step by step. The deprecated
+`/engine` alias still works for backward compatibility and opens the same picker.
 Changes are saved to `~/.rickshaw/settings.json` and take effect immediately.
+
+### `/model` — pick a model for the current provider
+
+`/model` opens the model picker for the currently active provider. It lists the
+provider's `available_models()` and, after a selection, advances to the effort
+picker if the model supports multiple effort levels.
+
+### `/effort` — pick the reasoning effort
+
+`/effort` opens the effort picker for the current provider/model. Only effort
+levels supported by the active model are shown. If the selected effort is not
+supported by a later model switch, it is reset to `medium` with a warning.
 
 ### `/login` — re-authenticate via OAuth
 
